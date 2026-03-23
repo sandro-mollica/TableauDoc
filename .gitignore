@@ -41,3 +41,7 @@ Thumbs.db
 # Project outputs
 data/
 img/
+
+# Local documentation variants
+DEVELOPMENT)REQUIREMENTS.md
+docs/DEVELOPMENT_REQUIREMENTS.md

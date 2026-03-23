@@ -120,16 +120,10 @@ config/config.json
 - fontes únicas
 - paletas de cor
 
-## Decisões importantes de implementação
-
 ### Diretório de saída fixo
 
 O script não usa o diretório atual de execução para gravar resultados.  
 Ele sempre grava em `data/` na raiz do projeto.
-
-### ` .hyper`
-
-Os arquivos ` .hyper` não são copiados para a pasta `data/`.
 
 ### Limpeza pós-processamento
 
@@ -164,18 +158,8 @@ Isso é usado em:
 - nem todo workbook publicado carrega no XML a estrutura completa da fonte publicada
 - a detecção de filtro de contexto depende do que estiver explícito no XML
 - alguns nomes técnicos de campos podem permanecer se o workbook não trouxer caption associado
-- a estrutura dos extracts remotos não é introspectada binariamente
 
 ## Dependências
 
 - `pandas`
 - `openpyxl`
-
-## Manutenção sugerida
-
-Se o script evoluir, priorizar:
-
-1. ampliar a tradução de nomes técnicos remanescentes
-2. melhorar a classificação de filtros de contexto
-3. ampliar a detecção de uso indireto de parâmetros e cálculos
-4. adicionar testes automatizados para workbooks de exemplo
