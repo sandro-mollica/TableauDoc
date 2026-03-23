@@ -51,13 +51,6 @@ def sanitize_filename(value: str) -> str:
     return safe or "arquivo"
 
 
-def normalize_name(value: str | None) -> str:
-    """Normaliza nomes para comparações frouxas entre arquivos e datasources."""
-    if not value:
-        return ""
-    return re.sub(r"[^a-z0-9]+", "", value.lower())
-
-
 def decode_tableau_text(value: str | None) -> str | None:
     """Normaliza entidades XML frequentes nas fórmulas do Tableau."""
     if value is None:
@@ -762,84 +755,6 @@ class TableauDoc:
             "field": match.group("field"),
             "raw": value,
         }
-
-    def _extract_hyper_structures(self, datasources: list[dict[str, Any]]) -> list[dict[str, Any]]:
-        """
-        Documenta a estrutura dos extracts a partir do metadata do workbook.
-
-        Observação: isso é inferido do XML do Tableau. O ambiente atual não
-        possui a Hyper API instalada para introspecção binária direta.
-        """
-        hyper_files = [item["path"] for item in self.package_manifest if item["kind"] == "extract"]
-        structures = []
-
-        for datasource in datasources:
-            if datasource.get("name") == "Parameters":
-                continue
-            has_extract = any(
-                relation.get("table", "").startswith("[Extract].")
-                for connection in datasource.get("connections", [])
-                for relation in connection.get("relations", [])
-            )
-            if not has_extract:
-                continue
-
-            matched_hyper = self._match_hyper_file(datasource, hyper_files)
-            fields = []
-            for column in datasource.get("columns", []):
-                field_name = column.get("caption") or clean_brackets(column.get("name"))
-                if not field_name:
-                    continue
-                fields.append(
-                    {
-                        "field": field_name,
-                        "internal_name": column.get("name"),
-                        "datatype": column.get("datatype"),
-                        "format": column.get("default_format") or column.get("default_type"),
-                        "role": self._friendly_role(column),
-                        "source": "workbook_metadata",
-                    }
-                )
-
-            fields = sorted(fields, key=lambda item: (item["field"] or "").lower())
-            structures.append(
-                {
-                    "hyper_file": matched_hyper,
-                    "datasource": datasource.get("caption") or datasource.get("name"),
-                    "note": "Estrutura inferida do metadata do workbook; o binário .hyper não foi copiado para data.",
-                    "field_count": len(fields),
-                    "fields": fields,
-                }
-            )
-
-        return structures
-
-    def _match_hyper_file(self, datasource: dict[str, Any], hyper_files: list[str]) -> str | None:
-        """Relaciona um datasource a um arquivo .hyper do pacote por similaridade de nome."""
-        datasource_name = normalize_name(datasource.get("caption") or datasource.get("name"))
-        best_match = None
-        best_score = -1
-        for hyper_file in hyper_files:
-            hyper_name = normalize_name(Path(hyper_file).stem)
-            score = len(set(re.findall(r"[a-z0-9]+", datasource_name)).intersection(re.findall(r"[a-z0-9]+", hyper_name)))
-            if datasource_name and datasource_name in hyper_name:
-                score += 10
-            if score > best_score:
-                best_match = hyper_file
-                best_score = score
-        return best_match
-
-    def _friendly_role(self, column: dict[str, Any]) -> str:
-        """Traduz role/tipo do Tableau para uma forma simples no relatório."""
-        role = (column.get("role") or "").lower()
-        if role == "measure":
-            return "measure"
-        if role == "dimension":
-            return "dimension"
-        default_type = (column.get("default_type") or "").lower()
-        if default_type in {"quantitative", "ordinal"}:
-            return "measure"
-        return "dimension"
 
     def _extract_worksheets(self) -> list[dict[str, Any]]:
         worksheets = []
@@ -1622,37 +1537,6 @@ class TableauDoc:
         else:
             lines.append("- Nenhuma fonte identificada.")
         lines.append("")
-        return lines
-
-    def _build_hyper_markdown(self) -> list[str]:
-        lines = ["## Estrutura dos Extracts Hyper", ""]
-        hyper_extracts = self.metadata.get("hyper_extracts", [])
-        if not hyper_extracts:
-            lines.append("- Nenhum extract Hyper identificado no workbook.")
-            return lines
-
-        lines.append("- Observação: a estrutura abaixo foi inferida a partir do metadata do workbook; os arquivos `.hyper` não foram copiados para `data`.")
-        lines.append("")
-        for extract in hyper_extracts:
-            lines.append(f"### {extract.get('datasource')}")
-            lines.append("")
-            lines.append(f"- Arquivo Hyper relacionado: `{extract.get('hyper_file') or '-'}`")
-            lines.append(f"- Quantidade de campos: {extract.get('field_count', 0)}")
-            lines.append("- Campos:")
-            for field in extract.get("fields", []):
-                lines.append(
-                    f"  - {field['field']} | datatype: {field.get('datatype') or '-'} | formato: {field.get('format') or '-'} | papel: {field.get('role') or '-'}"
-                )
-            lines.append("")
-        return lines
-
-    def _build_package_manifest_markdown(self) -> list[str]:
-        lines = ["## Conteúdo do Pacote", ""]
-        if not self.package_manifest:
-            lines.append("- Nenhum membro de pacote registrado.")
-            return lines
-        for item in self.package_manifest:
-            lines.append(f"- `{item['path']}` ({item['kind']}, {item['size_bytes']} bytes)")
         return lines
 
     def _write_excel(self) -> Path:
