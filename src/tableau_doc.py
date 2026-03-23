@@ -14,6 +14,7 @@ python3 Tableau_doc.py /caminho/arquivo.twbx --format all
 python3 Tableau_doc.py /caminho/arquivo.twb --format markdown
 python3 Tableau_doc.py /caminho/arquivo.twbx --format json
 python3 Tableau_doc.py /caminho/arquivo.twbx --format excel
+Versão 1.0 - 23/03/2026
 """
 
 from __future__ import annotations
