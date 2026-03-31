@@ -1,20 +1,22 @@
 # -*- coding: utf-8 -*-
 """
-Gera documentação técnica de workbooks Tableau (.twb/.twbx).
+Gera documentação técnica de workbooks Tableau (`.twb` e `.twbx`).
 
-O script:
-- lê um arquivo Tableau informado pelo usuário;
-- extrai todo o conteúdo do pacote para `data/<nome_do_arquivo>/`;
-- gera um mapa XPath/JSON do workbook;
-- gera documentação em Markdown, JSON e/ou Excel;
-- usa o mesmo nome-base do arquivo de entrada nos artefatos de saída.
+Fluxo principal:
+- lê um único workbook Tableau por execução;
+- extrai o XML do workbook e, quando necessário, o conteúdo do pacote `.twbx`;
+- monta um conjunto consolidado de metadados sobre fontes, planilhas, dashboards,
+  parâmetros, cálculos e elementos visuais;
+- gera artefatos de documentação em Markdown, RTF, JSON e/ou Excel;
+- opcionalmente complementa a leitura com um ou mais `.tdsx` externos definidos no
+  `config/config.json`.
 
-Opções de execução
-python3 Tableau_doc.py /caminho/arquivo.twbx --format all
-python3 Tableau_doc.py /caminho/arquivo.twb --format markdown
-python3 Tableau_doc.py /caminho/arquivo.twbx --format json
-python3 Tableau_doc.py /caminho/arquivo.twbx --format excel
-Versão 1.0 - 23/03/2026
+Exemplos:
+- `python3 Tableau_doc.py --format all`
+- `python3 Tableau_doc.py /caminho/arquivo.twbx --format markdown`
+- `python3 Tableau_doc.py /caminho/arquivo.twbx --format json`
+- `python3 Tableau_doc.py /caminho/arquivo.twbx --format excel`
+- `python3 Tableau_doc.py /caminho/arquivo.twbx --format rtf`
 """
 
 from __future__ import annotations
@@ -43,6 +45,18 @@ TEMPORARY_OUTPUT_NAMES = {
     "tmp",
     "temp",
 }
+
+# Fontes do documento RTF. Ajuste aqui caso queira personalizar a tipografia.
+RTF_BODY_FONT_NAME = "Calibre"
+RTF_MONO_FONT_NAME = "Courier New"
+TABLEAU_IMPLICIT_FONT_LABEL = "Fonte padrão do Tableau (não explicitada no XML)"
+SHOW_WORKSHEET_SHELF_COLUMNS_IN_RTF = False
+SHOW_FILTER_GROUP_VALUES_IN_RTF = False
+ENABLE_EXTERNAL_TDSX_LOOKUP = True
+
+# PRINTS_DE_PROGRESSO: comente esta constante e as chamadas de `_log_progress`
+# se quiser silenciar rapidamente as mensagens de acompanhamento.
+ENABLE_PROGRESS_PRINTS = True
 
 
 def sanitize_filename(value: str) -> str:
@@ -116,6 +130,50 @@ def unique_ordered(values: list[Any]) -> list[Any]:
         seen.add(marker)
         output.append(value)
     return output
+
+
+def compact_json(value: Any) -> str:
+    """Serializa estruturas aninhadas em uma linha legível."""
+    if value is None:
+        return "-"
+    if isinstance(value, (dict, list)):
+        return json.dumps(value, ensure_ascii=False, sort_keys=True)
+    return str(value)
+
+
+def format_yes_no(value: Any) -> str:
+    """Normaliza flags do XML para `sim` ou `não`."""
+    if isinstance(value, bool):
+        return "sim" if value else "não"
+    if value is None:
+        return "não"
+    text = str(value).strip().lower()
+    return "sim" if text in {"true", "1", "yes", "sim"} else "não"
+
+
+def _log_progress(message: str) -> None:
+    """Imprime mensagens destacadas de progresso durante a execução."""
+    if not ENABLE_PROGRESS_PRINTS:
+        return
+    print(f"[TableauDoc][progresso] {message}")
+
+
+def normalize_whitespace(value: str | None) -> str | None:
+    """Compacta quebras e espaços sem destruir o conteúdo técnico."""
+    if value is None:
+        return None
+    normalized = value.replace("\r\n", "\n").replace("\r", "\n").strip()
+    return normalized or None
+
+
+def normalize_lookup_token(value: str | None) -> str | None:
+    """Normaliza nomes para comparação flexível entre datasource e arquivo externo."""
+    if not value:
+        return None
+    text = value.strip().casefold()
+    text = re.sub(r"\s+", "_", text)
+    text = re.sub(r"[^\w.-]+", "_", text)
+    return text.strip("_") or None
 
 
 def element_path_with_indices(root: ET.Element, target: ET.Element) -> str:
@@ -247,7 +305,12 @@ class TableauDoc:
         },
     ]
 
-    def __init__(self, source_path: str | Path, output_format: str = "all") -> None:
+    def __init__(
+        self,
+        source_path: str | Path,
+        output_format: str = "all",
+        external_tdsx_paths: list[str | Path] | None = None,
+    ) -> None:
         self.source_path = Path(source_path).expanduser().resolve()
         if not self.source_path.exists():
             raise FileNotFoundError(f"Arquivo não encontrado: {self.source_path}")
@@ -258,6 +321,24 @@ class TableauDoc:
         self.base_name = self.source_path.stem
         self.output_dir = DEFAULT_OUTPUT_ROOT / self.base_name
         self.output_dir.mkdir(parents=True, exist_ok=True)
+        self.generated_at = datetime.now().strftime("%d/%m/%Y %H:%M:%S")
+        self.external_tdsx_paths = []
+        for path in external_tdsx_paths or []:
+            candidate = Path(path).expanduser()
+            if not candidate.exists():
+                continue
+            resolved = candidate.resolve()
+            if resolved not in self.external_tdsx_paths:
+                self.external_tdsx_paths.append(resolved)
+        _log_progress(
+            f"Iniciando documentação de `{self.source_path.name}` com formato `{self.output_format}`."
+        )
+        _log_progress(f"Diretório de saída preparado em `{self.output_dir}`.")
+        if self.external_tdsx_paths:
+            _log_progress(
+                "Busca externa de `.tdsx` habilitada em: "
+                + ", ".join(f"`{path}`" for path in self.external_tdsx_paths)
+            )
 
         self.workbook_name_in_package: str | None = None
         self.workbook_xml_bytes: bytes | None = None
@@ -265,6 +346,8 @@ class TableauDoc:
         self.assets_written: list[str] = []
         self.caption_lookup: dict[str, str] = {}
         self.caption_lookup_by_clean: dict[str, str] = {}
+        self.datasource_caption_lookup: dict[str, str] = {}
+        self.datasource_caption_lookup_by_clean: dict[str, str] = {}
 
         self.root = self._load_root_and_extract_contents()
         self.metadata = self._build_metadata()
@@ -272,8 +355,10 @@ class TableauDoc:
     def _load_root_and_extract_contents(self) -> ET.Element:
         """Lê o XML principal e salva o conteúdo bruto do workbook no diretório de saída."""
         suffix = self.source_path.suffix.lower()
+        _log_progress(f"Lendo arquivo de origem `{self.source_path}`.")
 
         if suffix == ".twb":
+            _log_progress("Arquivo `.twb` detectado; copiando workbook para a pasta de trabalho.")
             self.workbook_name_in_package = self.source_path.name
             self.workbook_xml_bytes = self.source_path.read_bytes()
             extracted_dir = self.output_dir / "package_contents"
@@ -288,8 +373,10 @@ class TableauDoc:
                     "size_bytes": self.source_path.stat().st_size,
                 }
             )
+            _log_progress("XML principal carregado a partir do arquivo `.twb`.")
             return ET.fromstring(self.workbook_xml_bytes)
 
+        _log_progress("Arquivo `.twbx` detectado; extraindo conteúdo do pacote.")
         with zipfile.ZipFile(self.source_path, "r") as archive:
             extracted_dir = self.output_dir / "package_contents"
             if extracted_dir.exists():
@@ -323,6 +410,9 @@ class TableauDoc:
 
             self.workbook_name_in_package = twb_names[0]
             self.workbook_xml_bytes = archive.read(twb_names[0])
+            _log_progress(
+                f"Pacote extraído com sucesso; workbook interno identificado como `{self.workbook_name_in_package}`."
+            )
             return ET.fromstring(self.workbook_xml_bytes)
 
     def _classify_package_member(self, package_path: str) -> str:
@@ -340,6 +430,7 @@ class TableauDoc:
 
     def _build_metadata(self) -> dict[str, Any]:
         """Consolida o workbook em uma estrutura única para saída JSON/MD/Excel."""
+        _log_progress("Iniciando extração de metadados do workbook.")
         workbook_info = {
             "source_file_name": self.source_path.name,
             "source_file_path": str(self.source_path),
@@ -354,19 +445,29 @@ class TableauDoc:
         }
 
         preferences = self._extract_preferences()
+        _log_progress("Preferências globais extraídas.")
         styles = self._extract_global_styles()
+        _log_progress("Estilos globais extraídos.")
         datasources = self._extract_datasources()
+        _log_progress(f"Fontes de dados extraídas: {len(datasources)}.")
+        self._enrich_datasources_with_external_tdsx(datasources)
         self._build_caption_lookup(datasources)
         parameters = self._extract_parameters(datasources)
+        _log_progress(f"Parâmetros identificados: {len(parameters)}.")
         calculations = self._extract_calculations(datasources, parameters)
+        _log_progress(f"Campos calculados identificados: {len(calculations)}.")
         worksheets = self._extract_worksheets()
+        _log_progress(f"Planilhas extraídas: {len(worksheets)}.")
         dashboards = self._extract_dashboards(worksheets)
+        _log_progress(f"Dashboards extraídos: {len(dashboards)}.")
         self._enrich_usage(parameters, calculations, worksheets, dashboards)
+        _log_progress("Relações de uso entre parâmetros, cálculos, planilhas e dashboards enriquecidas.")
         stories = self._extract_stories()
         windows = self._extract_windows()
         thumbnails = self._extract_thumbnails()
         colors = self._extract_visual_tokens(token_type="color")
         fonts = self._extract_visual_tokens(token_type="font")
+        _log_progress("Tokens visuais, stories, janelas e miniaturas processados.")
 
         return {
             "workbook": workbook_info,
@@ -402,7 +503,20 @@ class TableauDoc:
         """Monta um mapa global entre nomes internos e captions amigáveis."""
         self.caption_lookup = {}
         self.caption_lookup_by_clean = {}
+        self.datasource_caption_lookup = {}
+        self.datasource_caption_lookup_by_clean = {}
         for datasource in datasources:
+            datasource_name = datasource.get("name")
+            datasource_caption = datasource.get("caption") or datasource_name
+            if datasource_name and datasource_caption:
+                self.datasource_caption_lookup[datasource_name] = datasource_caption
+                cleaned_ds_name = normalize_lookup_token(clean_brackets(datasource_name))
+                if cleaned_ds_name:
+                    self.datasource_caption_lookup_by_clean[cleaned_ds_name] = datasource_caption
+            if datasource_caption:
+                cleaned_ds_caption = normalize_lookup_token(clean_brackets(datasource_caption))
+                if cleaned_ds_caption:
+                    self.datasource_caption_lookup_by_clean[cleaned_ds_caption] = datasource_caption
             for column in datasource.get("columns", []):
                 name = column.get("name")
                 caption = column.get("caption") or clean_brackets(name)
@@ -466,6 +580,11 @@ class TableauDoc:
             for connection in datasource.findall("./connection"):
                 connections.append(self._parse_connection(connection))
 
+            extracts = self._extract_extracts(datasource)
+            for connection in connections:
+                connection["mode"] = self._infer_connection_mode(connection, extracts)
+                connection["hyper_paths"] = self._extract_hyper_paths(extracts)
+
             datasource_info = {
                 "name": datasource.get("name"),
                 "caption": datasource.get("caption"),
@@ -474,6 +593,8 @@ class TableauDoc:
                 "hasconnection": datasource.get("hasconnection"),
                 "repository_location": self._extract_repository_location(datasource),
                 "connections": connections,
+                "extracts": extracts,
+                "relationship_maps": self._extract_relationship_map_from_root(root=datasource, source_label="twb/twbx"),
                 "columns": columns,
                 "metadata_records": metadata_records,
                 "connection_calculations": calculations,
@@ -483,10 +604,270 @@ class TableauDoc:
             datasources.append(datasource_info)
         return datasources
 
+    def _extract_extracts(self, datasource: ET.Element) -> list[dict[str, Any]]:
+        """Extrai metadados básicos dos blocos de extração do datasource."""
+        extracts: list[dict[str, Any]] = []
+        for extract in datasource.findall("./extract"):
+            extract_info = dict(extract.attrib)
+            extract_connection = extract.find("./connection")
+            extract_info["connection"] = dict(extract_connection.attrib) if extract_connection is not None else {}
+            extracts.append(extract_info)
+        return extracts
+
+    def _infer_connection_mode(
+        self,
+        connection: dict[str, Any],
+        extracts: list[dict[str, Any]],
+    ) -> str:
+        """Classifica a conexão como live, extração ou combinação de ambos."""
+        attributes = connection.get("attributes") or {}
+        connection_class = (attributes.get("class") or "").lower()
+
+        if connection_class == "hyper":
+            return "Extração"
+
+        extract_connections = [item.get("connection", {}) for item in extracts]
+        has_hyper_extract = any(
+            (extract_connection.get("class") or "").lower() == "hyper"
+            or str(extract_connection.get("dbname") or "").lower().endswith(".hyper")
+            for extract_connection in extract_connections
+        )
+        has_enabled_extract = any(str(item.get("enabled")).lower() == "true" for item in extracts)
+        has_disabled_extract = any(str(item.get("enabled")).lower() == "false" for item in extracts)
+
+        if has_hyper_extract and has_enabled_extract:
+            return "Live + extração habilitada"
+        if has_hyper_extract and has_disabled_extract:
+            return "Live + extração desabilitada"
+        return "Live"
+
+    def _extract_hyper_paths(self, extracts: list[dict[str, Any]]) -> list[str]:
+        """Retorna os caminhos de arquivos .hyper associados aos blocos de extração."""
+        paths = []
+        for extract in extracts:
+            connection = extract.get("connection", {}) or {}
+            dbname = connection.get("dbname")
+            if dbname and str(dbname).lower().endswith(".hyper"):
+                paths.append(str(dbname))
+        return unique_ordered(paths)
+
+    def _enrich_datasources_with_external_tdsx(self, datasources: list[dict[str, Any]]) -> None:
+        """Procura `.tdsx` externos e anexa SQL e relacionamentos quando disponíveis."""
+        if not self.external_tdsx_paths:
+            return
+
+        for datasource in datasources:
+            matches = self._find_matching_external_tdsx(datasource)
+            datasource["external_tdsx_matches"] = [str(path) for path in matches]
+            if not matches:
+                continue
+
+            _log_progress(
+                f"Buscando SQL externo para datasource `{datasource.get('caption') or datasource.get('name')}`."
+            )
+            external_sql_relations = []
+            external_relationship_maps = []
+            for tdsx_path in matches:
+                external_sql_relations.extend(self._extract_custom_sql_from_tdsx(tdsx_path))
+                external_relationship_maps.extend(self._extract_relationship_map_from_tdsx(tdsx_path))
+
+            datasource["external_custom_sql_relations"] = external_sql_relations
+            datasource["external_relationship_maps"] = external_relationship_maps
+
+    def _find_matching_external_tdsx(self, datasource: dict[str, Any]) -> list[Path]:
+        """Encontra possíveis `.tdsx` externos com base no nome da fonte."""
+        if datasource.get("name") == "Parameters" or not datasource.get("connections"):
+            return []
+
+        datasource_name = datasource.get("name") or ""
+        datasource_name_base = datasource_name.split(".", 1)[0] if "." in datasource_name else datasource_name
+        repo = datasource.get("repository_location") or {}
+        repo_name_candidates = [
+            repo.get("id"),
+            repo.get("path"),
+            repo.get("name"),
+        ]
+        tokens = {
+            normalize_lookup_token(datasource.get("caption")),
+            normalize_lookup_token(datasource_name),
+            normalize_lookup_token(datasource_name_base),
+            *(normalize_lookup_token(value) for value in repo_name_candidates),
+        }
+        tokens = {token for token in tokens if token}
+
+        matches: list[Path] = []
+        for root in self.external_tdsx_paths:
+            candidates = [root] if root.is_file() and root.suffix.lower() == ".tdsx" else root.rglob("*.tdsx")
+            for path in candidates:
+                path_tokens = {
+                    normalize_lookup_token(path.stem),
+                    normalize_lookup_token(path.name),
+                }
+                path_tokens = {token for token in path_tokens if token}
+                if tokens.intersection(path_tokens):
+                    matches.append(path)
+        matches = unique_ordered(matches)
+        if matches:
+            return matches
+
+        all_candidates: list[Path] = []
+        for root in self.external_tdsx_paths:
+            all_candidates.extend(
+                [root] if root.is_file() and root.suffix.lower() == ".tdsx" else list(root.rglob("*.tdsx"))
+            )
+        all_candidates = unique_ordered(all_candidates)
+        if len(all_candidates) == 1 and len((datasource.get("connections") or [])) > 0:
+            return all_candidates
+        return []
+
+    def _extract_custom_sql_from_tdsx(self, tdsx_path: Path) -> list[dict[str, Any]]:
+        """Extrai blocos de SQL customizado de um `.tdsx` externo."""
+        records: list[dict[str, Any]] = []
+        try:
+            with zipfile.ZipFile(tdsx_path, "r") as archive:
+                tds_names = [name for name in archive.namelist() if name.lower().endswith(".tds")]
+                for tds_name in tds_names:
+                    root = ET.fromstring(archive.read(tds_name))
+                    for relation in root.findall(".//relation"):
+                        relation_text = normalize_whitespace("".join(relation.itertext()))
+                        custom_sql = self._extract_relation_sql(relation, relation_text)
+                        if not custom_sql:
+                            continue
+                        records.append(
+                            {
+                                "tdsx_path": str(tdsx_path),
+                                "tds_path": tds_name,
+                                "relation_name": relation.get("name"),
+                                "relation_type": relation.get("type"),
+                                "custom_sql": custom_sql,
+                            }
+                        )
+        except (zipfile.BadZipFile, ET.ParseError, FileNotFoundError):
+            return []
+        return records
+
+    def _extract_relationship_map_from_tdsx(self, tdsx_path: Path) -> list[dict[str, Any]]:
+        """Extrai o mapa de relacionamentos entre tabelas a partir da tag `relationships`."""
+        records: list[dict[str, Any]] = []
+        try:
+            with zipfile.ZipFile(tdsx_path, "r") as archive:
+                tds_names = [name for name in archive.namelist() if name.lower().endswith(".tds")]
+                for tds_name in tds_names:
+                    root = ET.fromstring(archive.read(tds_name))
+                    for record in self._extract_relationship_map_from_root(root=root, source_label="tdsx"):
+                        record["tdsx_path"] = str(tdsx_path)
+                        record["tds_path"] = tds_name
+                        records.append(record)
+        except (zipfile.BadZipFile, ET.ParseError, FileNotFoundError):
+            return []
+        return records
+
+    def _extract_relationship_map_from_root(
+        self,
+        root: ET.Element,
+        source_label: str,
+    ) -> list[dict[str, Any]]:
+        """Extrai relacionamentos de um bloco XML que contenha object-graph e relationships."""
+        object_labels = {}
+        for obj in root.findall(".//object-graph//object"):
+            object_id = obj.get("id") or obj.get("object-id")
+            if object_id:
+                object_labels[object_id] = obj.get("caption") or obj.get("name") or object_id
+
+        records: list[dict[str, Any]] = []
+        for relationships in root.findall(".//relationships"):
+            for relationship in relationships.findall("./relationship"):
+                first = relationship.find("./first-end-point")
+                second = relationship.find("./second-end-point")
+                expression = relationship.find("./expression")
+
+                first_id = first.get("object-id") if first is not None else None
+                second_id = second.get("object-id") if second is not None else None
+                first_label = object_labels.get(first_id, first_id or "(sem origem)")
+                second_label = object_labels.get(second_id, second_id or "(sem destino)")
+                expression_text = self._relationship_expression_to_text(expression)
+                from_field, to_field = self._relationship_link_fields(expression)
+
+                records.append(
+                    {
+                        "source": source_label,
+                        "from_object_id": first_id,
+                        "to_object_id": second_id,
+                        "from_label": first_label,
+                        "to_label": second_label,
+                        "from_field": from_field,
+                        "to_field": to_field,
+                        "from_attributes": self._humanize_relationship_endpoint_attributes(
+                            first.attrib if first is not None else {},
+                            object_labels,
+                        ),
+                        "to_attributes": self._humanize_relationship_endpoint_attributes(
+                            second.attrib if second is not None else {},
+                            object_labels,
+                        ),
+                        "expression": expression_text,
+                    }
+                )
+        return records
+
+    def _humanize_relationship_endpoint_attributes(
+        self,
+        attributes: dict[str, Any],
+        object_labels: dict[str, str],
+    ) -> dict[str, Any]:
+        """Substitui object-id técnico por nome amigável da tabela/objeto."""
+        humanized = dict(attributes)
+        object_id = humanized.pop("object-id", None)
+        if object_id:
+            humanized["objeto"] = object_labels.get(object_id, object_id)
+        return humanized
+
+    def _relationship_expression_to_text(self, expression: ET.Element | None) -> str:
+        """Converte uma expressão XML de relacionamento em texto legível."""
+        if expression is None:
+            return "-"
+
+        children = list(expression)
+        op = expression.get("op")
+        if not children:
+            return op or "-"
+
+        child_texts = [self._relationship_expression_to_text(child) for child in children]
+        if len(child_texts) == 1:
+            return child_texts[0]
+        if op:
+            separator = f" {op} "
+            return separator.join(child_texts)
+        return " | ".join(child_texts)
+
+    def _relationship_link_fields(self, expression: ET.Element | None) -> tuple[str | None, str | None]:
+        """Extrai os campos de ligação principais de cada lado do relacionamento."""
+        if expression is None:
+            return None, None
+
+        children = list(expression)
+        if expression.get("op") == "=" and len(children) >= 2:
+            return (
+                self._relationship_expression_to_text(children[0]),
+                self._relationship_expression_to_text(children[1]),
+            )
+        if len(children) >= 2:
+            return (
+                self._relationship_expression_to_text(children[0]),
+                self._relationship_expression_to_text(children[1]),
+            )
+        return None, None
+
     def _parse_connection(self, connection: ET.Element) -> dict[str, Any]:
         relation_rows = []
         for relation in connection.findall(".//relation"):
-            relation_rows.append(dict(relation.attrib))
+            relation_info = dict(relation.attrib)
+            relation_text = normalize_whitespace("".join(relation.itertext()))
+            custom_sql = self._extract_relation_sql(relation, relation_text)
+            relation_info["text"] = relation_text
+            relation_info["custom_sql"] = custom_sql
+            relation_info["has_custom_sql"] = bool(custom_sql)
+            relation_rows.append(relation_info)
 
         named_connections = []
         for named in connection.findall("./named-connections/named-connection"):
@@ -497,6 +878,31 @@ class TableauDoc:
             "relations": relation_rows,
             "named_connections": named_connections,
         }
+
+    def _extract_relation_sql(self, relation: ET.Element, relation_text: str | None) -> str | None:
+        """Tenta localizar SQL customizado embutido em relations do Tableau."""
+        candidate_values = [
+            relation.get("formula"),
+            relation.get("query"),
+            relation.get("command"),
+            relation.get("sql"),
+            relation_text,
+        ]
+
+        name = (relation.get("name") or "").lower()
+        relation_type = (relation.get("type") or "").lower()
+        for candidate in candidate_values:
+            text = normalize_whitespace(decode_tableau_text(candidate) if candidate else candidate)
+            if not text:
+                continue
+            lowered = text.lower()
+            looks_like_sql = any(
+                token in lowered
+                for token in ["select ", "\nselect ", "with ", "\nwith ", " from ", "\nfrom ", "union ", "join "]
+            )
+            if looks_like_sql or relation_type == "text" or "custom sql" in name:
+                return text
+        return None
 
     def _parse_column(self, column: ET.Element) -> dict[str, Any]:
         aliases = [
@@ -593,9 +999,11 @@ class TableauDoc:
                         "origin": "column",
                         "name": column.get("name"),
                         "caption": column.get("caption") or clean_brackets(column.get("name")),
+                        "aliases": column.get("aliases", []),
                         "role": column.get("role"),
                         "datatype": column.get("datatype"),
                         "type": column.get("type"),
+                        "hidden": column.get("hidden"),
                         "formula": column.get("formula"),
                     }
                 )
@@ -611,9 +1019,11 @@ class TableauDoc:
                         "origin": "connection.calculations",
                         "name": calc.get("column"),
                         "caption": clean_brackets(calc.get("column")),
+                        "aliases": [],
                         "role": None,
                         "datatype": None,
                         "type": None,
+                        "hidden": None,
                         "formula": calc.get("formula"),
                     }
                 )
@@ -632,9 +1042,11 @@ class TableauDoc:
                         "origin": "metadata-record",
                         "name": record.get("local_name"),
                         "caption": record.get("caption") or clean_brackets(record.get("local_name")),
+                        "aliases": [],
                         "role": None,
                         "datatype": record.get("local_type"),
                         "type": record.get("class"),
+                        "hidden": None,
                         "formula": formula.strip('"'),
                     }
                 )
@@ -756,6 +1168,266 @@ class TableauDoc:
             "raw": value,
         }
 
+    def _humanize_datasource_reference(self, value: str | None) -> str | None:
+        """Converte o nome técnico do datasource para caption amigável, quando disponível."""
+        if not value:
+            return None
+        if value in self.datasource_caption_lookup:
+            return self.datasource_caption_lookup[value]
+        normalized = normalize_lookup_token(clean_brackets(value))
+        if normalized and normalized in self.datasource_caption_lookup_by_clean:
+            return self.datasource_caption_lookup_by_clean[normalized]
+        base_name = value.split(".", 1)[0] if "." in value else value
+        normalized_base = normalize_lookup_token(clean_brackets(base_name))
+        if normalized_base and normalized_base in self.datasource_caption_lookup_by_clean:
+            return self.datasource_caption_lookup_by_clean[normalized_base]
+        return value
+
+    def _worksheet_calculation_labels(self, worksheet_name: str) -> list[str]:
+        """
+        Retorna os cálculos usados em uma planilha sem duplicar o mesmo campo calculado.
+        A deduplicação usa preferencialmente o nome interno para não colidir campos
+        distintos que compartilhem o mesmo caption.
+        """
+        labels_by_key: dict[str, str] = {}
+        fallback_index = 0
+        for calculation in self.metadata["calculations"]:
+            if worksheet_name not in calculation.get("used_in_worksheets", []):
+                continue
+
+            label = calculation.get("caption") or clean_brackets(calculation.get("name")) or "(sem nome)"
+            internal_name = calculation.get("name")
+            key = internal_name or f"fallback::{label}::{calculation.get('datasource')}::{fallback_index}"
+            if key not in labels_by_key:
+                labels_by_key[key] = label
+            fallback_index += 1
+
+        return sorted(labels_by_key.values(), key=str.lower)
+
+    def _custom_sql_by_connection(self, datasource: dict[str, Any]) -> list[dict[str, Any]]:
+        """
+        Retorna no máximo um SQL por conexão do datasource.
+        Se houver o mesmo SQL repetido em várias relations da mesma conexão,
+        apenas a primeira ocorrência é mantida.
+        """
+        records: list[dict[str, Any]] = []
+        for index, connection in enumerate(datasource.get("connections", []), start=1):
+            seen_sql: set[str] = set()
+            for relation in connection.get("relations", []):
+                custom_sql = relation.get("custom_sql")
+                if not custom_sql or custom_sql in seen_sql:
+                    continue
+                seen_sql.add(custom_sql)
+                records.append(
+                    {
+                        "connection_index": index,
+                        "relation_name": relation.get("name") or relation.get("table") or f"relation_{index}",
+                        "custom_sql": custom_sql,
+                    }
+                )
+                break
+        return records
+
+    def _dedupe_external_custom_sql_relations(
+        self,
+        relations: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        """Remove SQLs externos repetidos preservando a primeira ocorrência."""
+        unique_relations: list[dict[str, Any]] = []
+        seen_sql: set[str] = set()
+        for relation in relations:
+            custom_sql = relation.get("custom_sql")
+            if not custom_sql or custom_sql in seen_sql:
+                continue
+            seen_sql.add(custom_sql)
+            unique_relations.append(relation)
+        return unique_relations
+
+    def _dedupe_relationship_maps(self, relations: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """Remove relacionamentos duplicados e consolida as origens encontradas."""
+        unique_relations_by_key: dict[str, dict[str, Any]] = {}
+        for relation in relations:
+            key = json.dumps(
+                {
+                    "from_object_id": relation.get("from_object_id"),
+                    "to_object_id": relation.get("to_object_id"),
+                    "expression": relation.get("expression"),
+                },
+                ensure_ascii=False,
+                sort_keys=True,
+            )
+            if key not in unique_relations_by_key:
+                merged = dict(relation)
+                source = relation.get("source")
+                merged["sources"] = [source] if source else []
+                unique_relations_by_key[key] = merged
+                continue
+
+            merged = unique_relations_by_key[key]
+            source = relation.get("source")
+            if source and source not in merged["sources"]:
+                merged["sources"].append(source)
+            if relation.get("tdsx_path") and not merged.get("tdsx_path"):
+                merged["tdsx_path"] = relation.get("tdsx_path")
+            if relation.get("tds_path") and not merged.get("tds_path"):
+                merged["tds_path"] = relation.get("tds_path")
+        return list(unique_relations_by_key.values())
+
+    def _reference_tokens(self, name: str | None, caption: str | None) -> list[str]:
+        """Monta variações de referência para busca em fórmulas e metadados."""
+        tokens = []
+        if name:
+            tokens.append(name)
+            clean_name = clean_brackets(name)
+            if clean_name:
+                tokens.append(f"[{clean_name}]")
+        if caption:
+            tokens.append(f"[{caption}]")
+            tokens.append(caption)
+        return unique_ordered([token for token in tokens if token])
+
+    def _object_identifier(self, item: dict[str, Any], fallback_prefix: str) -> str:
+        """Gera um identificador estável para cálculos e parâmetros."""
+        name = item.get("name")
+        if name:
+            return str(name)
+        caption = item.get("caption") or clean_brackets(item.get("name")) or "(sem nome)"
+        return f"{fallback_prefix}::{caption}"
+
+    def _collect_unused_objects(self) -> dict[str, list[dict[str, Any]]]:
+        """
+        Identifica cálculos, parâmetros e fontes de dados sem uso efetivo.
+
+        Regras:
+        - cálculo/parâmetro não pode ser usado em planilhas ou dashboards
+        - cálculo/parâmetro não pode ser referenciado por outro cálculo ou parâmetro
+        - datasource não pode ser usado em planilhas/dashboards
+        - datasource não pode ser referenciado por cálculo/parâmetro fora da lista de não usados
+        """
+        calculations = self.metadata["calculations"]
+        parameters = self.metadata["parameters"]
+        datasources = self.metadata["datasources"]
+
+        calc_ids = {self._object_identifier(item, "calc"): item for item in calculations}
+        param_ids = {self._object_identifier(item, "param"): item for item in parameters}
+
+        calc_referenced_by: dict[str, set[str]] = {key: set() for key in calc_ids}
+        param_referenced_by: dict[str, set[str]] = {key: set() for key in param_ids}
+
+        calc_tokens = {
+            key: self._reference_tokens(item.get("name"), item.get("caption") or clean_brackets(item.get("name")))
+            for key, item in calc_ids.items()
+        }
+        param_tokens = {
+            key: self._reference_tokens(item.get("name"), item.get("caption") or clean_brackets(item.get("name")))
+            for key, item in param_ids.items()
+        }
+
+        containers: list[tuple[str, str]] = []
+        for key, item in calc_ids.items():
+            containers.append((f"calc::{key}", item.get("formula_pretty") or item.get("formula") or ""))
+        for key, item in param_ids.items():
+            source = item.get("source_field") or ""
+            source_details = compact_json(item.get("source_field_details")) if item.get("source_field_details") else ""
+            members = " ".join(item.get("members", []))
+            containers.append((f"param::{key}", " ".join([source, source_details, members]).strip()))
+
+        for container_id, text in containers:
+            if not text:
+                continue
+            for key, tokens in calc_tokens.items():
+                if container_id == f"calc::{key}":
+                    continue
+                if any(token and token in text for token in tokens):
+                    calc_referenced_by[key].add(container_id)
+            for key, tokens in param_tokens.items():
+                if container_id == f"param::{key}":
+                    continue
+                if any(token and token in text for token in tokens):
+                    param_referenced_by[key].add(container_id)
+
+        unused_calculation_ids = {
+            key
+            for key, item in calc_ids.items()
+            if not item.get("used_in_worksheets")
+            and not item.get("used_in_dashboards")
+            and not calc_referenced_by[key]
+        }
+        unused_parameter_ids = {
+            key
+            for key, item in param_ids.items()
+            if not item.get("used_in_worksheets")
+            and not item.get("used_in_dashboards")
+            and not param_referenced_by[key]
+        }
+
+        unused_calculations = [calc_ids[key] for key in unused_calculation_ids]
+        unused_parameters = [param_ids[key] for key in unused_parameter_ids]
+
+        active_datasource_refs = set()
+        for item in calculations:
+            item_id = self._object_identifier(item, "calc")
+            if item_id in unused_calculation_ids:
+                continue
+            if item.get("datasource"):
+                active_datasource_refs.add(item.get("datasource"))
+        for item in parameters:
+            item_id = self._object_identifier(item, "param")
+            if item_id in unused_parameter_ids:
+                continue
+            source_details = item.get("source_field_details") or {}
+            if source_details.get("datasource"):
+                active_datasource_refs.add(source_details.get("datasource"))
+
+        worksheet_datasources = {
+            self._humanize_datasource_reference(value) or value
+            for worksheet in self.metadata["worksheets"]
+            for value in worksheet.get("datasource_dependencies", [])
+        }
+        dashboard_datasources = {
+            self._humanize_datasource_reference(value) or value
+            for dashboard in self.metadata["dashboards"]
+            for value in dashboard.get("datasource_dependencies", [])
+        }
+
+        unused_datasources = []
+        for datasource in datasources:
+            ds_name = datasource.get("caption") or datasource.get("name") or "(sem nome)"
+            if ds_name in worksheet_datasources or ds_name in dashboard_datasources:
+                continue
+            if ds_name in active_datasource_refs or datasource.get("name") in active_datasource_refs:
+                continue
+            unused_datasources.append(datasource)
+
+        return {
+            "calculations": sorted(
+                unused_calculations,
+                key=lambda item: (item.get("caption") or clean_brackets(item.get("name")) or "").lower(),
+            ),
+            "parameters": sorted(
+                unused_parameters,
+                key=lambda item: (item.get("caption") or clean_brackets(item.get("name")) or "").lower(),
+            ),
+            "datasources": sorted(
+                unused_datasources,
+                key=lambda item: (item.get("caption") or item.get("name") or "").lower(),
+            ),
+        }
+
+    def _infer_datasource_type(self, datasource: dict[str, Any]) -> str:
+        """Classifica a fonte como lógica ou física com base na estrutura das relations."""
+        relationship_maps = self._dedupe_relationship_maps(
+            (datasource.get("relationship_maps") or []) + (datasource.get("external_relationship_maps") or [])
+        )
+        relation_types = {
+            (relation.get("type") or "").lower()
+            for connection in datasource.get("connections", [])
+            for relation in connection.get("relations", [])
+        }
+        if relationship_maps or "collection" in relation_types:
+            return "lógico"
+        return "físico (join)"
+
     def _extract_worksheets(self) -> list[dict[str, Any]]:
         worksheets = []
         for worksheet in self.root.findall("./worksheets/worksheet"):
@@ -846,6 +1518,14 @@ class TableauDoc:
                 key=lambda item: (item.get("field_label") or "").lower(),
             )
 
+            worksheet_colors = []
+            worksheet_fonts = []
+            for worksheet_name in unique_ordered([sheet for sheet in sheets if sheet]):
+                worksheet = next((item for item in worksheets if item.get("name") == worksheet_name), None)
+                if worksheet:
+                    worksheet_colors.extend(worksheet.get("colors_used", []))
+                    worksheet_fonts.extend(worksheet.get("fonts_used", []))
+
             dashboards.append(
                 {
                     "name": dashboard_name,
@@ -862,8 +1542,8 @@ class TableauDoc:
                     "filters_exposed": exposed_filters,
                     "filters_used": combined_filters,
                     "device_layouts": device_layouts,
-                    "colors_used": unique_ordered(self._collect_colors(dashboard)),
-                    "fonts_used": unique_ordered(self._collect_fonts(dashboard)),
+                    "colors_used": unique_ordered(self._collect_colors(dashboard) + worksheet_colors),
+                    "fonts_used": unique_ordered(self._collect_fonts(dashboard) + worksheet_fonts),
                 }
             )
         return dashboards
@@ -1112,6 +1792,41 @@ class TableauDoc:
                 fonts.append(item.get("fontname"))
         return fonts
 
+    def _display_fonts(self, fonts: list[str] | None) -> list[str]:
+        """Retorna fontes para exibição, com fallback quando o XML não explicita a tipografia."""
+        values = sorted(set(fonts or []), key=str.lower)
+        return values or [TABLEAU_IMPLICIT_FONT_LABEL]
+
+    def _format_aliases(self, aliases: list[dict[str, Any]] | None) -> list[str]:
+        """Converte aliases em linhas curtas e legíveis."""
+        rows = []
+        for alias in aliases or []:
+            key = alias.get("key")
+            value = alias.get("value")
+            if key and value:
+                rows.append(f"{key} -> {value}")
+            elif value:
+                rows.append(str(value))
+            elif key:
+                rows.append(str(key))
+        return unique_ordered(rows)
+
+    def _display_object_name(self, item: dict[str, Any], allow_clean_brackets: bool = True) -> str:
+        """Retorna o nome mais amigável disponível para um objeto do Tableau."""
+        if item.get("caption"):
+            return str(item["caption"])
+        if allow_clean_brackets:
+            cleaned_name = clean_brackets(item.get("name"))
+            if cleaned_name:
+                return cleaned_name
+        if item.get("name"):
+            return str(item["name"])
+        return "(sem nome)"
+
+    def _display_real_name(self, item: dict[str, Any]) -> str:
+        """Retorna o nome técnico/original do objeto para auditoria."""
+        return item.get("name") or self._display_object_name(item)
+
     def _collect_columns_from_dependencies(self, element: ET.Element) -> list[str]:
         columns = []
         for column in element.findall(".//datasource-dependencies/column"):
@@ -1160,6 +1875,7 @@ class TableauDoc:
 
     def generate_xpath_json_map(self) -> tuple[Path, Path]:
         """Gera o documento humano-legível e a versão JSON do mapa XPath/JSON."""
+        _log_progress("Gerando mapa XPath/JSON.")
         map_rows = []
         for definition in self.MAP_DEFINITIONS:
             count = self._count_xpath_matches(definition["xpath"])
@@ -1206,6 +1922,7 @@ class TableauDoc:
             )
 
         map_md_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        _log_progress("Mapa XPath/JSON gerado com sucesso.")
         return map_md_path, map_json_path
 
     def _count_xpath_matches(self, xpath: str) -> int:
@@ -1222,10 +1939,12 @@ class TableauDoc:
     def write_outputs(self) -> list[Path]:
         """Escreve o mapa e os artefatos solicitados para o diretório de saída."""
         written_files: list[Path] = []
+        _log_progress("Iniciando escrita dos artefatos finais.")
 
         workbook_xml_path = self.output_dir / f"{self.base_name}.xml"
         workbook_xml_path.write_bytes(self.workbook_xml_bytes or b"")
         written_files.append(workbook_xml_path)
+        _log_progress(f"Arquivo XML salvo em `{workbook_xml_path.name}`.")
 
         map_md_path, map_json_path = self.generate_xpath_json_map()
         written_files.extend([map_md_path, map_json_path])
@@ -1234,6 +1953,9 @@ class TableauDoc:
             written_files.append(self._write_json())
         if self.output_format in {"all", "markdown"}:
             written_files.append(self._write_markdown())
+            written_files.append(self._write_rtf())
+        if self.output_format == "rtf":
+            written_files.append(self._write_rtf())
         if self.output_format in {"all", "excel"}:
             written_files.append(self._write_excel())
 
@@ -1254,6 +1976,7 @@ class TableauDoc:
         )
         written_files.append(manifest_path)
         self._cleanup_temporary_outputs()
+        _log_progress(f"Processamento concluído. Total de arquivos gerados: {len(written_files)}.")
         return written_files
 
     def _cleanup_temporary_outputs(self) -> None:
@@ -1263,6 +1986,7 @@ class TableauDoc:
         Mantém os arquivos finais de documentação e miniaturas, removendo
         diretórios intermediários temporários.
         """
+        _log_progress("Removendo artefatos temporários de processamento.")
         for name in TEMPORARY_OUTPUT_NAMES:
             path = self.output_dir / name
             if not path.exists():
@@ -1277,6 +2001,7 @@ class TableauDoc:
 
     def _write_json(self) -> Path:
         output_path = self.output_dir / f"{self.base_name}.json"
+        _log_progress(f"Gerando arquivo JSON `{output_path.name}`.")
         output_path.write_text(
             json.dumps(self.metadata, ensure_ascii=False, indent=2),
             encoding="utf-8",
@@ -1285,15 +2010,17 @@ class TableauDoc:
 
     def _write_markdown(self) -> Path:
         output_path = self.output_dir / f"{self.base_name}.md"
+        _log_progress(f"Gerando arquivo Markdown `{output_path.name}`.")
         lines = [
             f"# Documentação do Workbook Tableau - {self.source_path.name}",
+            "",
+            f"Relatório gerado em {self.generated_at}",
             "",
             "## Resumo",
             "",
             f"- Caminho de origem: `{self.source_path}`",
             f"- Tipo do arquivo: `{self.source_path.suffix.lower()}`",
             f"- Última alteração do arquivo: `{self.metadata['workbook']['source_file_last_modified']}`",
-            f"- Diretório de saída: `{self.output_dir}`",
             f"- Datasources: {self.metadata['summary']['datasource_count']}",
             f"- Parâmetros: {self.metadata['summary']['parameter_count']}",
             f"- Campos calculados: {self.metadata['summary']['calculation_count']}",
@@ -1306,12 +2033,6 @@ class TableauDoc:
 
         for key, value in self.metadata["workbook"]["attributes"].items():
             lines.append(f"- {key}: `{value}`")
-        if self.metadata["workbook"]["repository_location"]:
-            lines.append("")
-            lines.append("### Repository Location")
-            lines.append("")
-            for key, value in self.metadata["workbook"]["repository_location"].items():
-                lines.append(f"- {key}: `{value}`")
 
         lines.extend(self._build_datasources_markdown())
         lines.extend(self._build_dashboards_markdown())
@@ -1319,9 +2040,626 @@ class TableauDoc:
         lines.extend(self._build_preferences_markdown())
         lines.extend(self._build_parameters_markdown())
         lines.extend(self._build_calculations_markdown())
+        lines.extend(self._build_unused_objects_markdown())
 
         output_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
         return output_path
+
+    def _write_rtf(self) -> Path:
+        output_path = self.output_dir / f"{self.base_name}.rtf"
+        _log_progress(f"Gerando arquivo RTF `{output_path.name}`.")
+        body = self._build_rtf_document()
+        header = (
+            r"{\rtf1\ansi\deff0"
+            rf"{{\fonttbl{{\f0 {self._rtf_escape(RTF_BODY_FONT_NAME)};}}{{\f1 {self._rtf_escape(RTF_MONO_FONT_NAME)};}}}}"
+            r"\viewkind4\uc1"
+        )
+        output_path.write_text(header + body + "}", encoding="utf-8")
+        return output_path
+
+    def _build_rtf_document(self) -> str:
+        parts: list[str] = []
+        summary = self.metadata["summary"]
+        workbook = self.metadata["workbook"]
+
+        parts.append(self._rtf_paragraph(f"Documentação do Workbook Tableau - {self.source_path.name}", style="title"))
+        parts.append(self._rtf_paragraph(f"Relatório gerado em {self.generated_at}", style="body"))
+
+        parts.append(self._rtf_paragraph("Seção de dados gerais", style="section"))
+        parts.append(self._rtf_paragraph("Resumo", style="subsection"))
+        parts.append(self._rtf_bullet(f"Caminho de origem: {self.source_path}"))
+        parts.append(self._rtf_bullet(f"Tipo do arquivo: {self.source_path.suffix.lower()}"))
+        parts.append(self._rtf_bullet(f"Última alteração do arquivo: {workbook['source_file_last_modified']}"))
+        parts.append(self._rtf_bullet(f"Datasources: {summary['datasource_count']}"))
+        parts.append(self._rtf_bullet(f"Parâmetros: {summary['parameter_count']}"))
+        parts.append(self._rtf_bullet(f"Campos calculados: {summary['calculation_count']}"))
+        parts.append(self._rtf_bullet(f"Worksheets: {summary['worksheet_count']}"))
+        parts.append(self._rtf_bullet(f"Dashboards: {summary['dashboard_count']}"))
+        parts.append(self._rtf_bullet(f"Itens do pacote: {summary['package_member_count']}"))
+
+        parts.append(self._rtf_paragraph("Workbook", style="subsection"))
+        parts.append(self._rtf_bullet(f"Arquivo no pacote: {workbook.get('package_workbook_name') or '-'}"))
+        for key, value in workbook.get("attributes", {}).items():
+            parts.append(self._rtf_bullet(f"{key}: {value}"))
+
+        parts.append(self._rtf_paragraph("Seção Fontes de dados", style="section"))
+        parts.append(self._rtf_paragraph("Fontes de dados", style="subsection"))
+        datasources = self.metadata["datasources"]
+        if not datasources:
+            parts.append(self._rtf_bullet("Nenhuma fonte de dados identificada."))
+        for datasource in datasources:
+            ds_name = datasource.get("caption") or datasource.get("name") or "(sem nome)"
+            datasource_type = self._infer_datasource_type(datasource)
+            package_custom_sql_by_connection = self._custom_sql_by_connection(datasource)
+            external_custom_sql_relations = self._dedupe_external_custom_sql_relations(
+                datasource.get("external_custom_sql_relations", [])
+            )
+            relationship_maps = self._dedupe_relationship_maps(
+                (datasource.get("relationship_maps") or []) + (datasource.get("external_relationship_maps") or [])
+            )
+            parts.append(self._rtf_paragraph(ds_name, style="subsubsection"))
+            parts.append(self._rtf_bullet(f"Tipo: {datasource_type}", level=1))
+            parts.append(self._rtf_bullet(f"Versão: {datasource.get('version')}", level=1))
+            parts.append(self._rtf_bullet(f"Inline: {datasource.get('inline')}", level=1))
+            parts.append(self._rtf_bullet(f"Has connection: {datasource.get('hasconnection')}", level=1))
+            parts.append(self._rtf_bullet(f"Quantidade de conexões: {len(datasource.get('connections', []))}", level=1))
+            parts.append(self._rtf_bullet(f"Quantidade de campos: {len(datasource.get('columns', []))}", level=1))
+            parts.append(self._rtf_bullet(f"Quantidade de metadata records: {len(datasource.get('metadata_records', []))}", level=1))
+            parts.append(self._rtf_bullet(f"Quantidade de cálculos na conexão: {len(datasource.get('connection_calculations', []))}", level=1))
+            parts.append(self._rtf_bullet(f"Quantidade de objetos: {datasource.get('object_count')}", level=1))
+            parts.append(self._rtf_paragraph("Campos da fonte de dados", style="body_bold", level=1))
+            if datasource.get("columns"):
+                for column in datasource.get("columns", []):
+                    column_name = self._display_object_name(column)
+                    parts.append(self._rtf_bullet(column_name, level=2))
+                    parts.append(self._rtf_bullet(f"Nome interno: {column.get('name')}", level=3))
+                    parts.append(self._rtf_bullet(f"Datatype: {column.get('datatype') or '-'}", level=3))
+                    parts.append(self._rtf_bullet(f"Role: {column.get('role') or '-'}", level=3))
+                    parts.append(self._rtf_bullet(f"Oculto: {format_yes_no(column.get('hidden'))}", level=3))
+                    alias_rows = self._format_aliases(column.get("aliases", []))
+                    parts.extend(
+                        self._rtf_list_block(
+                            "Aliases",
+                            alias_rows,
+                            level=3,
+                            empty_text="nenhum alias",
+                        )
+                    )
+            else:
+                parts.append(self._rtf_bullet("Nenhum campo identificado.", level=2))
+            repo = datasource.get("repository_location") or {}
+            if repo:
+                parts.append(self._rtf_paragraph("Localização publicada", style="body_bold", level=1))
+                for key, value in repo.items():
+                    parts.append(self._rtf_bullet(f"{key}: {value}", level=2))
+            for index, connection in enumerate(datasource.get("connections", []), start=1):
+                parts.append(self._rtf_paragraph(f"Conexão {index}", style="body_bold", level=1))
+                parts.append(self._rtf_bullet(f"Atributos: {compact_json(connection.get('attributes'))}", level=2))
+                parts.append(self._rtf_bullet(f"Modo da conexão: {connection.get('mode') or '-'}", level=2))
+                if connection.get("hyper_paths"):
+                    parts.extend(
+                        self._rtf_list_block(
+                            "Arquivos .hyper associados",
+                            connection.get("hyper_paths", []),
+                            level=2,
+                            empty_text="-",
+                        )
+                    )
+                connection_diagram = self._build_connection_diagram(connection, relationship_maps=relationship_maps)
+                if connection_diagram:
+                    parts.append(self._rtf_bullet("Estrutura da conexão:", level=2))
+                    parts.append(self._rtf_code_block(connection_diagram, level=3))
+                connection_sql = next(
+                    (item for item in package_custom_sql_by_connection if item.get("connection_index") == index),
+                    None,
+                )
+                if connection_sql:
+                    parts.append(self._rtf_bullet("SQL customizado:", level=2))
+                    parts.append(self._rtf_code_block(connection_sql["custom_sql"], level=3))
+            if not package_custom_sql_by_connection:
+                parts.append(self._rtf_bullet("SQL customizado encontrado no pacote: não", level=1))
+            if external_custom_sql_relations:
+                parts.append(self._rtf_bullet("SQL customizado encontrado em `.tdsx` externo: sim", level=1))
+                for relation in external_custom_sql_relations:
+                    relation_name = relation.get("relation_name") or "(sem nome)"
+                    parts.append(
+                        self._rtf_bullet(
+                            f"Origem externa: {relation.get('tdsx_path')} | relation: {relation_name}",
+                            level=2,
+                        )
+                    )
+                    parts.append(self._rtf_bullet("SQL externo:", level=2))
+                    parts.append(self._rtf_code_block(relation["custom_sql"], level=3))
+            elif datasource.get("external_tdsx_matches"):
+                parts.append(self._rtf_bullet("SQL customizado encontrado em `.tdsx` externo: não", level=1))
+            if relationship_maps:
+                parts.append(self._rtf_paragraph("Mapa de relacionamentos", style="body_bold", level=1))
+                for relation in relationship_maps:
+                    from_label = relation.get("from_label") or "(sem origem)"
+                    to_label = relation.get("to_label") or "(sem destino)"
+                    parts.append(self._rtf_bullet(f"{from_label} -> {to_label}", level=2))
+                    parts.append(self._rtf_bullet(f"Condição: {relation.get('expression') or '-'}", level=3))
+                    if relation.get("from_field"):
+                        parts.append(self._rtf_bullet(f"Campo de ligação na origem: {relation.get('from_field')}", level=3))
+                    if relation.get("to_field"):
+                        parts.append(self._rtf_bullet(f"Campo de ligação no destino: {relation.get('to_field')}", level=3))
+                    relation_sources = relation.get("sources") or ([relation.get("source")] if relation.get("source") else [])
+                    if relation_sources:
+                        parts.append(self._rtf_bullet(f"Origem: {', '.join(relation_sources)}", level=3))
+                    from_attrs = relation.get("from_attributes") or {}
+                    to_attrs = relation.get("to_attributes") or {}
+                    if from_attrs:
+                        parts.append(self._rtf_bullet(f"Atributos de origem: {compact_json(from_attrs)}", level=3))
+                    if to_attrs:
+                        parts.append(self._rtf_bullet(f"Atributos de destino: {compact_json(to_attrs)}", level=3))
+
+        parts.append(self._rtf_paragraph("Seção de Dashboards", style="section"))
+        parts.append(self._rtf_paragraph("Dashboards", style="subsection"))
+        dashboards = self.metadata["dashboards"]
+        if not dashboards:
+            parts.append(self._rtf_bullet("Nenhum dashboard encontrado."))
+        for dashboard in dashboards:
+            dashboard_name = dashboard.get("name") or "(sem nome)"
+            parts.append(self._rtf_paragraph(dashboard_name, style="subsubsection"))
+
+            parts.append(self._rtf_paragraph("Planilhas", style="body_bold", level=1))
+            worksheet_members = dashboard.get("worksheet_members") or []
+            if not worksheet_members:
+                parts.append(self._rtf_bullet("Nenhuma planilha identificada.", level=2))
+            for worksheet_name in worksheet_members:
+                worksheet = next((item for item in self.metadata["worksheets"] if item.get("name") == worksheet_name), None)
+                calculations_used = self._worksheet_calculation_labels(worksheet_name)
+                parameters_used = sorted(
+                    [
+                        param.get("caption") or clean_brackets(param.get("name")) or "(sem nome)"
+                        for param in self.metadata["parameters"]
+                        if worksheet_name in param.get("used_in_worksheets", [])
+                    ],
+                    key=str.lower,
+                )
+                parts.append(self._rtf_paragraph(worksheet_name, style="body_bold", level=2))
+                if worksheet and worksheet.get("title"):
+                    parts.append(self._rtf_bullet(f"Título formatado: {compact_json(worksheet.get('title'))}", level=3))
+                parts.extend(
+                    self._rtf_list_block(
+                        "Datasources dependentes",
+                        [
+                            self._humanize_datasource_reference(value) or value
+                            for value in (worksheet.get("datasource_dependencies", []) if worksheet else [])
+                        ],
+                        level=3,
+                        empty_text="-",
+                    )
+                )
+                parts.append(self._rtf_bullet("Campos referenciados:", level=3))
+                referenced_columns = worksheet.get("referenced_columns", []) if worksheet else []
+                if referenced_columns:
+                    for referenced_column in referenced_columns:
+                        parts.append(self._rtf_bullet(referenced_column, level=4))
+                else:
+                    parts.append(self._rtf_bullet("Nenhum campo referenciado identificado.", level=4))
+                if SHOW_WORKSHEET_SHELF_COLUMNS_IN_RTF:
+                    parts.append(
+                        self._rtf_bullet(
+                            f"Campos em shelves: {', '.join(worksheet.get('shelf_columns', [])) if worksheet else '-'}",
+                            level=3,
+                        )
+                    )
+
+                parts.append(self._rtf_paragraph("Campos calculados", style="body_bold", level=3))
+                if calculations_used:
+                    for calculation_name in calculations_used:
+                        parts.append(self._rtf_bullet(calculation_name, level=4))
+                else:
+                    parts.append(self._rtf_bullet("Nenhum campo calculado associado.", level=4))
+
+                parts.append(self._rtf_paragraph("Filtros", style="body_bold", level=3))
+                worksheet_filters = worksheet.get("filters", []) if worksheet else []
+                if worksheet_filters:
+                    for filter_item in worksheet_filters:
+                        field_label = filter_item.get("field_label") or filter_item.get("column") or "(sem nome)"
+                        parts.append(
+                            self._rtf_bullet(
+                                f"{field_label} | tipo: {filter_item.get('class') or '-'} | contexto: {'sim' if filter_item.get('is_context') else 'não'}",
+                                level=4,
+                            )
+                        )
+                        if SHOW_FILTER_GROUP_VALUES_IN_RTF and filter_item.get("groupfilters"):
+                            parts.append(
+                                self._rtf_bullet(
+                                    f"Valores/grupos: {compact_json(filter_item.get('groupfilters'))}",
+                                    level=5,
+                                )
+                            )
+                else:
+                    parts.append(self._rtf_bullet("Nenhum filtro identificado.", level=4))
+
+                parts.append(self._rtf_paragraph("Parâmetros", style="body_bold", level=3))
+                if parameters_used:
+                    for parameter_name in parameters_used:
+                        parts.append(self._rtf_bullet(parameter_name, level=4))
+                else:
+                    parts.append(self._rtf_bullet("Nenhum parâmetro associado.", level=4))
+
+            parts.append(self._rtf_paragraph("Filtros expostos no painel", style="body_bold", level=1))
+            exposed_filters = dashboard.get("filters_exposed") or []
+            if exposed_filters:
+                for filter_item in exposed_filters:
+                    field_label = filter_item.get("field_label") or filter_item.get("param") or "(sem nome)"
+                    parts.append(
+                        self._rtf_bullet(
+                            f"{field_label} | modo: {filter_item.get('mode') or '-'} | valores: {filter_item.get('values') or '-'}",
+                            level=2,
+                        )
+                    )
+            else:
+                parts.append(self._rtf_bullet("Nenhum filtro exposto identificado.", level=2))
+
+            parts.append(self._rtf_paragraph("Zonas de layout", style="body_bold", level=1))
+            if dashboard.get("zones"):
+                for zone in dashboard["zones"]:
+                    zone_summary = (
+                        f"id={zone.get('id')} | nome={zone.get('name') or '-'} | tipo={zone.get('type_v2') or '-'} "
+                        f"| x={zone.get('x') or '-'} | y={zone.get('y') or '-'} | w={zone.get('w') or '-'} | h={zone.get('h') or '-'}"
+                    )
+                    parts.append(self._rtf_bullet(zone_summary, level=2))
+            else:
+                parts.append(self._rtf_bullet("Nenhuma zona identificada.", level=2))
+
+            parts.append(self._rtf_paragraph("Layout de devices", style="body_bold", level=1))
+            if dashboard.get("device_layouts"):
+                for layout in dashboard["device_layouts"]:
+                    parts.append(
+                        self._rtf_bullet(
+                            f"{layout.get('name') or '(sem nome)'} | auto generated: {layout.get('auto_generated') or '-'} | zonas: {len(layout.get('zones', []))}",
+                            level=2,
+                        )
+                    )
+            else:
+                parts.append(self._rtf_bullet("Nenhum layout de device identificado.", level=2))
+
+            parts.append(self._rtf_paragraph("Cores usadas", style="body_bold", level=1))
+            colors_used = sorted(set(dashboard.get("colors_used", [])), key=str.lower)
+            if colors_used:
+                for color in colors_used:
+                    parts.append(self._rtf_bullet(color, level=2))
+            else:
+                parts.append(self._rtf_bullet("Nenhuma cor identificada.", level=2))
+
+            parts.append(self._rtf_paragraph("Fontes usadas", style="body_bold", level=1))
+            fonts_used = self._display_fonts(dashboard.get("fonts_used", []))
+            for font in fonts_used:
+                parts.append(self._rtf_bullet(font, level=2))
+
+        parts.append(self._rtf_paragraph("Seção Visual", style="section"))
+        parts.append(self._rtf_paragraph("Tokens Visuais", style="subsection"))
+
+        parts.append(self._rtf_paragraph("Cores", style="body_bold", level=1))
+        visual_colors = sorted(
+            {item["value"] for item in self.metadata["visual_tokens"]["colors"] if item.get("value")},
+            key=str.lower,
+        )
+        if visual_colors:
+            for color in visual_colors:
+                parts.append(self._rtf_bullet(color, level=2))
+        else:
+            parts.append(self._rtf_bullet("Nenhuma cor identificada.", level=2))
+
+        parts.append(self._rtf_paragraph("Paletas de Cor", style="body_bold", level=1))
+        palettes = self.metadata["preferences"]["color_palettes"]
+        if palettes:
+            for palette in palettes:
+                palette_name = palette.get("name") or "(sem nome)"
+                parts.append(
+                    self._rtf_bullet(
+                        f"{palette_name} | tipo: {palette.get('type') or '-'} | custom: {palette.get('custom') or '-'}",
+                        level=2,
+                    )
+                )
+                for color in palette.get("colors", []):
+                    parts.append(self._rtf_bullet(color, level=3, mono=self._looks_like_hex_color(color)))
+        else:
+                parts.append(self._rtf_bullet("Nenhuma paleta de cor identificada.", level=2))
+
+        parts.append(self._rtf_paragraph("Fontes", style="body_bold", level=1))
+        visual_fonts = self._display_fonts(
+            [item["value"] for item in self.metadata["visual_tokens"]["fonts"] if item.get("value")]
+        )
+        for font in visual_fonts:
+            parts.append(self._rtf_bullet(font, level=2))
+
+        parts.append(self._rtf_paragraph("Preferências e Paletas", style="body_bold", level=1))
+        preferences = self.metadata["preferences"]["preferences"]
+        if preferences:
+            for pref in preferences:
+                parts.append(self._rtf_bullet(f"{pref.get('name')}: {pref.get('value')}", level=2))
+        else:
+            parts.append(self._rtf_bullet("Nenhuma preferência global identificada.", level=2))
+        if palettes:
+            for palette in palettes:
+                parts.append(
+                    self._rtf_bullet(
+                        f"Paleta {palette.get('name') or '(sem nome)'} com {len(palette.get('colors', []))} cores",
+                        level=2,
+                    )
+                )
+
+        parts.append(self._rtf_paragraph("Seção Parâmetros", style="section"))
+        parts.append(self._rtf_paragraph("Parâmetros", style="subsection"))
+        parameters = self.metadata["parameters"]
+        if not parameters:
+            parts.append(self._rtf_bullet("Nenhum parâmetro encontrado."))
+        for parameter in parameters:
+            name = parameter.get("caption") or clean_brackets(parameter.get("name")) or "(sem nome)"
+            parts.append(self._rtf_paragraph(name, style="subsubsection"))
+            parts.append(self._rtf_bullet(f"Nome interno: {parameter.get('name')}", level=1))
+            parts.append(self._rtf_bullet(f"Datatype: {parameter.get('datatype')}", level=1))
+            parts.append(self._rtf_bullet(f"Type: {parameter.get('type')}", level=1))
+            parts.append(self._rtf_bullet(f"Role: {parameter.get('role')}", level=1))
+            parts.append(self._rtf_bullet(f"Domínio: {parameter.get('param_domain_type')}", level=1))
+            parts.append(self._rtf_bullet(f"Valor atual/default: {parameter.get('value')}", level=1))
+            parts.extend(
+                self._rtf_list_block(
+                    "Membros",
+                    parameter.get("members", []),
+                    level=1,
+                    empty_text="-",
+                )
+            )
+            source_field = parameter.get("source_field_details")
+            if source_field:
+                parts.append(self._rtf_bullet(f"Preenchido por campo da fonte: {compact_json(source_field)}", level=1))
+            else:
+                parts.append(self._rtf_bullet("Preenchido por campo da fonte: não", level=1))
+            used_dashboards = sorted(parameter.get("used_in_dashboards", []), key=str.lower)
+            used_worksheets = sorted(parameter.get("used_in_worksheets", []), key=str.lower)
+            parts.extend(
+                self._rtf_list_block(
+                    "Usado nos dashboards",
+                    used_dashboards,
+                    level=1,
+                    empty_text="não identificado",
+                )
+            )
+            parts.extend(
+                self._rtf_list_block(
+                    "Usado nas planilhas",
+                    used_worksheets,
+                    level=1,
+                    empty_text="não identificado",
+                )
+            )
+
+        parts.append(self._rtf_paragraph("Relação de Campos Calculados", style="section"))
+        parts.append(self._rtf_paragraph("Relação de Campos Calculados", style="subsection"))
+        calculations = self.metadata["calculations"]
+        if not calculations:
+            parts.append(self._rtf_bullet("Nenhum campo calculado encontrado."))
+        grouped_calculations: dict[str, list[dict[str, Any]]] = {}
+        for calculation in calculations:
+            grouped_calculations.setdefault(calculation.get("datasource") or "(sem datasource)", []).append(calculation)
+        for datasource_name, items in grouped_calculations.items():
+            parts.append(self._rtf_paragraph(datasource_name, style="subsubsection"))
+            for item in items:
+                caption = self._display_object_name(item)
+                parts.append(self._rtf_paragraph(caption, style="body_bold", level=1))
+                parts.append(self._rtf_bullet(f"Nome interno: {item.get('name')}", level=2))
+                parts.append(self._rtf_bullet(f"Origem: {item.get('origin')}", level=2))
+                parts.append(self._rtf_bullet(f"Role: {item.get('role') or '-'}", level=2))
+                parts.append(self._rtf_bullet(f"Datatype: {item.get('datatype') or '-'}", level=2))
+                parts.append(self._rtf_bullet(f"Type: {item.get('type') or '-'}", level=2))
+                parts.append(self._rtf_bullet(f"Oculto: {format_yes_no(item.get('hidden'))}", level=2))
+                parts.extend(
+                    self._rtf_list_block(
+                        "Aliases",
+                        self._format_aliases(item.get("aliases", [])),
+                        level=2,
+                        empty_text="nenhum alias",
+                    )
+                )
+                parts.extend(
+                    self._rtf_list_block(
+                        "Impacta / é referenciado por",
+                        sorted(item.get("impacts", []), key=str.lower),
+                        level=2,
+                        empty_text="nenhum outro campo calculado",
+                    )
+                )
+                used_in_dashboards = sorted(item.get("used_in_dashboards", []), key=str.lower)
+                used_in_worksheets = sorted(item.get("used_in_worksheets", []), key=str.lower)
+                parts.extend(
+                    self._rtf_list_block(
+                        "Usado nos dashboards",
+                        used_in_dashboards,
+                        level=2,
+                        empty_text="não identificado",
+                    )
+                )
+                if used_in_worksheets:
+                    for worksheet_name in used_in_worksheets:
+                        parts.append(self._rtf_bullet(f"Planilha: {worksheet_name}", level=2))
+                else:
+                    parts.append(self._rtf_bullet("Planilha: não identificado", level=2))
+                parts.append(self._rtf_bullet("Código:", level=2))
+                parts.append(self._rtf_code_block(item.get("codigo") or "-", level=3))
+
+        unused_objects = self._collect_unused_objects()
+        parts.append(self._rtf_paragraph("Objetos não usados", style="section"))
+        parts.append(self._rtf_paragraph("Objetos não usados", style="subsection"))
+
+        parts.append(self._rtf_paragraph("Campos calculados", style="body_bold", level=1))
+        if unused_objects["calculations"]:
+            for item in unused_objects["calculations"]:
+                caption = self._display_object_name(item)
+                parts.append(self._rtf_bullet(caption, level=2))
+                parts.append(self._rtf_bullet(f"Nome real: {self._display_real_name(item)}", level=3))
+                parts.extend(
+                    self._rtf_list_block(
+                        "Aliases",
+                        self._format_aliases(item.get("aliases", [])),
+                        level=3,
+                        empty_text="nenhum alias",
+                    )
+                )
+        else:
+            parts.append(self._rtf_bullet("Nenhum campo calculado não usado identificado.", level=2))
+
+        parts.append(self._rtf_paragraph("Parâmetros", style="body_bold", level=1))
+        if unused_objects["parameters"]:
+            for item in unused_objects["parameters"]:
+                caption = self._display_object_name(item)
+                parts.append(self._rtf_bullet(caption, level=2))
+                parts.append(self._rtf_bullet(f"Nome real: {self._display_real_name(item)}", level=3))
+                parts.extend(
+                    self._rtf_list_block(
+                        "Aliases",
+                        self._format_aliases(item.get("aliases", [])),
+                        level=3,
+                        empty_text="nenhum alias",
+                    )
+                )
+        else:
+            parts.append(self._rtf_bullet("Nenhum parâmetro não usado identificado.", level=2))
+
+        parts.append(self._rtf_paragraph("Fontes de dados", style="body_bold", level=1))
+        if unused_objects["datasources"]:
+            for item in unused_objects["datasources"]:
+                caption = self._display_object_name(item, allow_clean_brackets=False)
+                parts.append(self._rtf_bullet(caption, level=2))
+                parts.append(self._rtf_bullet(f"Nome real: {self._display_real_name(item)}", level=3))
+        else:
+            parts.append(self._rtf_bullet("Nenhuma fonte de dados não usada identificada.", level=2))
+
+        return "".join(parts)
+
+    def _rtf_paragraph(self, text: str, style: str = "body", level: int = 0, mono: bool = False) -> str:
+        escaped = self._rtf_escape(text)
+        indent = 360 * max(level, 0)
+        if style == "title":
+            return rf"\pard\sa240\sb160\f0\fs32\b {escaped}\b0\par"
+        if style == "section":
+            return rf"\pard\sa200\sb120\li{indent}\f0\fs28\b {escaped}\b0\par"
+        if style == "subsection":
+            return rf"\pard\sa160\sb80\li{indent}\f0\fs24\b {escaped}\b0\par"
+        if style == "subsubsection":
+            return rf"\pard\sa120\sb60\li{indent}\f0\fs22\b {escaped}\b0\par"
+        if style == "body_bold":
+            return rf"\pard\sa80\sb40\li{indent}\f0\fs21\b {escaped}\b0\par"
+        font_id = 1 if mono else 0
+        return rf"\pard\sa60\sb20\li{indent}\f{font_id}\fs20 {escaped}\par"
+
+    def _rtf_bullet(self, text: str, level: int = 0, mono: bool = False) -> str:
+        indent = 360 * max(level, 0)
+        hanging = 180
+        escaped = self._rtf_escape(text)
+        font_id = 1 if mono else 0
+        return rf"\pard\sa40\sb20\li{indent}\fi-{hanging}\f{font_id}\fs20 \'95\tab {escaped}\par"
+
+    def _rtf_code_block(self, text: str, level: int = 0) -> str:
+        indent = 360 * max(level, 0)
+        escaped = self._rtf_escape(text)
+        return rf"\pard\sa60\sb40\li{indent}\f1\fs20 {escaped}\par"
+
+    def _rtf_list_block(
+        self,
+        label: str,
+        values: list[Any],
+        level: int = 0,
+        empty_text: str = "-",
+        mono: bool = False,
+    ) -> list[str]:
+        parts = [self._rtf_bullet(f"{label}:", level=level)]
+        if values:
+            for value in values:
+                parts.append(self._rtf_bullet(str(value), level=level + 1, mono=mono))
+        else:
+            parts.append(self._rtf_bullet(empty_text, level=level + 1, mono=mono))
+        return parts
+
+    def _rtf_escape(self, text: Any) -> str:
+        value = "" if text is None else str(text)
+        output: list[str] = []
+        for char in value:
+            if char == "\\":
+                output.append(r"\\")
+            elif char == "{":
+                output.append(r"\{")
+            elif char == "}":
+                output.append(r"\}")
+            elif char == "\n":
+                output.append(r"\line ")
+            elif char == "\t":
+                output.append(r"\tab ")
+            else:
+                codepoint = ord(char)
+                if 32 <= codepoint <= 126:
+                    output.append(char)
+                else:
+                    signed = codepoint if codepoint <= 32767 else codepoint - 65536
+                    output.append(rf"\u{signed}?")
+        return "".join(output)
+
+    def _looks_like_hex_color(self, value: str | None) -> bool:
+        if not value:
+            return False
+        return bool(re.fullmatch(r"#(?:[0-9a-fA-F]{3}|[0-9a-fA-F]{6}|[0-9a-fA-F]{8})", value.strip()))
+
+    def _build_connection_diagram(
+        self,
+        connection: dict[str, Any],
+        relationship_maps: list[dict[str, Any]] | None = None,
+    ) -> str:
+        """Monta um desenho textual simples de conexões e relacionamentos."""
+        lines: list[str] = []
+        attributes = connection.get("attributes") or {}
+        connection_label = attributes.get("class") or "connection"
+        lines.append(connection_label)
+
+        named_connections = connection.get("named_connections") or []
+        relations = connection.get("relations") or []
+        relationship_maps = relationship_maps or []
+
+        if named_connections:
+            lines.append("|")
+            lines.append("+-- named-connections")
+            for named in named_connections:
+                caption = named.get("caption") or named.get("name") or "(sem nome)"
+                name = named.get("name")
+                suffix = f" [{name}]" if name and name != caption else ""
+                lines.append(f"|   +-- {caption}{suffix}")
+
+        if relationship_maps:
+            lines.append("|")
+            lines.append("+-- relationships")
+            for relation in relationship_maps:
+                from_label = relation.get("from_label") or "(sem origem)"
+                to_label = relation.get("to_label") or "(sem destino)"
+                from_field = relation.get("from_field") or "-"
+                to_field = relation.get("to_field") or "-"
+                lines.append(f"|   +-- {from_label} -> {to_label}")
+                lines.append(f"|       \\-- {from_field} = {to_field}")
+
+        if relations:
+            lines.append("|")
+            lines.append("+-- relations")
+            for relation in relations:
+                relation_name = relation.get("name") or relation.get("table") or relation.get("type") or "(sem nome)"
+                relation_type = relation.get("type") or "-"
+                relation_connection = relation.get("connection")
+                table_name = relation.get("table")
+
+                detail_parts = [f"tipo={relation_type}"]
+                if relation_connection:
+                    detail_parts.append(f"connection={relation_connection}")
+                if table_name and table_name != relation_name:
+                    detail_parts.append(f"table={table_name}")
+
+                lines.append(f"    +-- {relation_name}")
+                lines.append(f"        \\-- {' | '.join(detail_parts)}")
+
+        if len(lines) == 1:
+            return ""
+        return "\n".join(lines)
 
     def _build_datasources_markdown(self) -> list[str]:
         lines = ["", "## Fontes de Dados", ""]
@@ -1332,19 +2670,89 @@ class TableauDoc:
 
         for datasource in datasources:
             name = datasource.get("caption") or datasource.get("name") or "(sem nome)"
+            datasource_type = self._infer_datasource_type(datasource)
             repo = datasource.get("repository_location") or {}
             is_published = bool(repo)
+            custom_sql_relations = self._custom_sql_by_connection(datasource)
+            external_custom_sql_relations = self._dedupe_external_custom_sql_relations(
+                datasource.get("external_custom_sql_relations", [])
+            )
+            relationship_maps = self._dedupe_relationship_maps(
+                (datasource.get("relationship_maps") or []) + (datasource.get("external_relationship_maps") or [])
+            )
             lines.append(f"### {name}")
             lines.append("")
-            lines.append(f"- Nome interno: `{datasource.get('name')}`")
+            lines.append(f"- Tipo: `{datasource_type}`")
             lines.append(f"- Versão: `{datasource.get('version')}`")
             lines.append(f"- Publicada: `{'sim' if is_published else 'não'}`")
+            if datasource.get("connections"):
+                for index, connection in enumerate(datasource.get("connections", []), start=1):
+                    lines.append(f"- Conexão {index}: modo `{connection.get('mode') or '-'}`")
+                    if connection.get("hyper_paths"):
+                        lines.append(f"  - Arquivos .hyper associados: {', '.join(connection.get('hyper_paths', []))}")
             if is_published:
                 lines.append(f"- Site: `{repo.get('site', '-')}`")
                 lines.append(f"- Path: `{repo.get('path', '-')}`")
                 lines.append(f"- ID: `{repo.get('id', '-')}`")
                 lines.append(f"- Revision: `{repo.get('revision', '-')}`")
             lines.append(f"- Quantidade de campos mapeados: {len(datasource.get('columns', []))}")
+            if datasource.get("columns"):
+                lines.append("- Campos da fonte de dados:")
+                for column in datasource.get("columns", []):
+                    column_name = self._display_object_name(column)
+                    lines.append(f"  - {column_name}")
+                    lines.append(f"    Nome interno: `{column.get('name')}`")
+                    lines.append(f"    Datatype: `{column.get('datatype') or '-'}`")
+                    lines.append(f"    Role: `{column.get('role') or '-'}`")
+                    lines.append(f"    Oculto: `{format_yes_no(column.get('hidden'))}`")
+                    alias_rows = self._format_aliases(column.get('aliases', []))
+                    if alias_rows:
+                        lines.append("    Aliases:")
+                        for alias in alias_rows:
+                            lines.append(f"      - {alias}")
+                    else:
+                        lines.append("    Aliases: nenhum alias")
+            if custom_sql_relations:
+                lines.append("- SQL customizado encontrado no pacote: sim")
+                for index, relation in enumerate(custom_sql_relations, start=1):
+                    relation_name = relation.get("relation_name") or f"relation_{index}"
+                    connection_index = relation.get("connection_index")
+                    lines.append(f"- SQL customizado da conexão {connection_index}: `{relation_name}`")
+                    lines.append("```sql")
+                    lines.append(relation["custom_sql"])
+                    lines.append("```")
+            else:
+                lines.append("- SQL customizado encontrado no pacote: não")
+            if external_custom_sql_relations:
+                lines.append("- SQL customizado encontrado em `.tdsx` externo: sim")
+                for index, relation in enumerate(external_custom_sql_relations, start=1):
+                    relation_name = relation.get("relation_name") or f"relation_{index}"
+                    lines.append(
+                        f"- SQL externo {index}: `{relation_name}` | origem: `{relation.get('tdsx_path')}`"
+                    )
+                    lines.append("```sql")
+                    lines.append(relation["custom_sql"])
+                    lines.append("```")
+            elif datasource.get("external_tdsx_matches"):
+                lines.append("- SQL customizado encontrado em `.tdsx` externo: não")
+            if relationship_maps:
+                lines.append("- Mapa de relacionamentos:")
+                for relation in relationship_maps:
+                    from_label = relation.get("from_label") or "(sem origem)"
+                    to_label = relation.get("to_label") or "(sem destino)"
+                    lines.append(f"  - {from_label} -> {to_label}")
+                    lines.append(f"    Condição: {relation.get('expression') or '-'}")
+                    if relation.get("from_field"):
+                        lines.append(f"    Campo de ligação na origem: {relation.get('from_field')}")
+                    if relation.get("to_field"):
+                        lines.append(f"    Campo de ligação no destino: {relation.get('to_field')}")
+                    relation_sources = relation.get("sources") or ([relation.get("source")] if relation.get("source") else [])
+                    if relation_sources:
+                        lines.append(f"    Origem: {', '.join(relation_sources)}")
+                    if relation.get("from_attributes"):
+                        lines.append(f"    Atributos de origem: {compact_json(relation.get('from_attributes'))}")
+                    if relation.get("to_attributes"):
+                        lines.append(f"    Atributos de destino: {compact_json(relation.get('to_attributes'))}")
             lines.append("")
         return lines
 
@@ -1429,6 +2837,14 @@ class TableauDoc:
                 lines.append(f"- Campo: `{item.get('caption')}`")
                 lines.append(f"- Nome interno: `{item.get('name')}`")
                 lines.append(f"- Origem: `{item.get('origin')}`")
+                lines.append(f"- Oculto: `{format_yes_no(item.get('hidden'))}`")
+                alias_rows = self._format_aliases(item.get("aliases", []))
+                if alias_rows:
+                    lines.append("- Aliases:")
+                    for alias in alias_rows:
+                        lines.append(f"  - {alias}")
+                else:
+                    lines.append("- Aliases: nenhum alias")
                 codigo = item.get("codigo") or "-"
                 lines.append(f"- Código: {codigo}")
                 impacts = sorted(item.get("impacts", []), key=str.lower)
@@ -1453,6 +2869,58 @@ class TableauDoc:
                 lines.append("")
         return lines
 
+    def _build_unused_objects_markdown(self) -> list[str]:
+        lines = ["## Objetos não usados", ""]
+        unused_objects = self._collect_unused_objects()
+
+        lines.append("### Campos calculados")
+        lines.append("")
+        if unused_objects["calculations"]:
+            for item in unused_objects["calculations"]:
+                caption = self._display_object_name(item)
+                lines.append(f"- {caption}")
+                lines.append(f"  - Nome real: {self._display_real_name(item)}")
+                alias_rows = self._format_aliases(item.get("aliases", []))
+                if alias_rows:
+                    lines.append("  - Aliases:")
+                    for alias in alias_rows:
+                        lines.append(f"    - {alias}")
+                else:
+                    lines.append("  - Aliases: nenhum alias")
+        else:
+            lines.append("- Nenhum campo calculado não usado identificado.")
+
+        lines.append("")
+        lines.append("### Parâmetros")
+        lines.append("")
+        if unused_objects["parameters"]:
+            for item in unused_objects["parameters"]:
+                caption = self._display_object_name(item)
+                lines.append(f"- {caption}")
+                lines.append(f"  - Nome real: {self._display_real_name(item)}")
+                alias_rows = self._format_aliases(item.get("aliases", []))
+                if alias_rows:
+                    lines.append("  - Aliases:")
+                    for alias in alias_rows:
+                        lines.append(f"    - {alias}")
+                else:
+                    lines.append("  - Aliases: nenhum alias")
+        else:
+            lines.append("- Nenhum parâmetro não usado identificado.")
+
+        lines.append("")
+        lines.append("### Fontes de dados")
+        lines.append("")
+        if unused_objects["datasources"]:
+            for item in unused_objects["datasources"]:
+                caption = self._display_object_name(item, allow_clean_brackets=False)
+                lines.append(f"- {caption}")
+                lines.append(f"  - Nome real: {self._display_real_name(item)}")
+        else:
+            lines.append("- Nenhuma fonte de dados não usada identificada.")
+        lines.append("")
+        return lines
+
     def _build_dashboards_markdown(self) -> list[str]:
         lines = ["## Dashboards", ""]
         dashboards = self.metadata["dashboards"]
@@ -1473,7 +2941,11 @@ class TableauDoc:
                     datasources = worksheet.get("datasource_dependencies", []) if worksheet else []
                     lines.append(f"  - {member}")
                     if datasources:
-                        lines.append(f"    Fonte de dados: {', '.join(sorted(datasources, key=str.lower))}")
+                        friendly_datasources = sorted(
+                            [self._humanize_datasource_reference(value) or value for value in datasources],
+                            key=str.lower,
+                        )
+                        lines.append(f"    Fonte de dados: {', '.join(friendly_datasources)}")
                     else:
                         lines.append("    Fonte de dados: nenhuma identificada")
             else:
@@ -1505,7 +2977,7 @@ class TableauDoc:
             lines.append(f"- Zonas no layout: {len(dashboard.get('zones', []))}")
             lines.append(f"- Layouts de device: {len(dashboard.get('device_layouts', []))}")
             unique_colors = sorted(set(dashboard.get("colors_used", [])), key=str.lower)
-            unique_fonts = sorted(set(dashboard.get("fonts_used", [])), key=str.lower)
+            unique_fonts = self._display_fonts(dashboard.get("fonts_used", []))
             lines.append(f"- Cores usadas: {', '.join(unique_colors) or '-'}")
             lines.append(f"- Fontes usadas: {', '.join(unique_fonts) or '-'}")
             lines.append("")
@@ -1516,7 +2988,7 @@ class TableauDoc:
         colors = self.metadata["visual_tokens"]["colors"]
         fonts = self.metadata["visual_tokens"]["fonts"]
         unique_color_values = sorted({item["value"] for item in colors if item.get("value")}, key=str.lower)
-        unique_font_values = sorted({item["value"] for item in fonts if item.get("value")}, key=str.lower)
+        unique_font_values = self._display_fonts([item["value"] for item in fonts if item.get("value")])
 
         lines.append(f"- Total de cores únicas: {len(unique_color_values)}")
         lines.append(f"- Total de fontes únicas: {len(unique_font_values)}")
@@ -1531,16 +3003,14 @@ class TableauDoc:
         lines.append("")
         lines.append("### Fontes")
         lines.append("")
-        if unique_font_values:
-            for font in unique_font_values:
-                lines.append(f"- `{font}`")
-        else:
-            lines.append("- Nenhuma fonte identificada.")
+        for font in unique_font_values:
+            lines.append(f"- `{font}`")
         lines.append("")
         return lines
 
     def _write_excel(self) -> Path:
         output_path = self.output_dir / f"{self.base_name}.xlsx"
+        _log_progress(f"Gerando arquivo Excel `{output_path.name}`.")
         with pd.ExcelWriter(output_path) as writer:
             self._to_frame(self.metadata["parameters"]).to_excel(writer, sheet_name="Parameters", index=False)
             self._to_frame(self.metadata["calculations"]).to_excel(writer, sheet_name="Calculations", index=False)
@@ -1566,8 +3036,8 @@ class TableauDoc:
         return df
 
 
-def load_path_from_config(config_path: str | Path | None = None) -> str:
-    """Lê o caminho padrão do arquivo Tableau a partir do config.json."""
+def load_config(config_path: str | Path | None = None) -> dict[str, Any]:
+    """Lê o arquivo de configuração padrão do projeto."""
     config_file = Path(config_path) if config_path is not None else PROJECT_ROOT / "config" / "config.json"
     if not config_file.exists():
         raise FileNotFoundError(
@@ -1579,12 +3049,41 @@ def load_path_from_config(config_path: str | Path | None = None) -> str:
     except json.JSONDecodeError as exc:
         raise ValueError(f"O arquivo '{config_file}' não contém um JSON válido.") from exc
 
+    if not isinstance(config_data, dict):
+        raise ValueError(f"O arquivo '{config_file}' deve conter um objeto JSON na raiz.")
+    return config_data
+
+
+def load_path_from_config(config_path: str | Path | None = None) -> str:
+    """Lê o caminho padrão do arquivo Tableau a partir do config.json."""
+    config_data = load_config(config_path)
     tableau_path = config_data.get("tableau_path")
     if not tableau_path:
-        raise ValueError(
-            f"O arquivo '{config_file}' não possui a chave obrigatória 'tableau_path'."
-        )
+        config_file = Path(config_path) if config_path is not None else PROJECT_ROOT / "config" / "config.json"
+        raise ValueError(f"O arquivo '{config_file}' não possui a chave obrigatória 'tableau_path'.")
+    if not isinstance(tableau_path, str):
+        raise ValueError("A chave 'tableau_path' do config.json deve ser uma string.")
+    if not tableau_path.strip():
+        raise ValueError("A chave 'tableau_path' do config.json não pode estar vazia.")
     return tableau_path
+
+
+def load_external_tdsx_paths_from_config(config_path: str | Path | None = None) -> list[str]:
+    """Lê os caminhos opcionais de `.tdsx` externo definidos em config."""
+    if not ENABLE_EXTERNAL_TDSX_LOOKUP:
+        return []
+
+    config_data = load_config(config_path)
+    raw_paths = config_data.get("external_tdsx_paths", [])
+    if raw_paths is None:
+        return []
+    if isinstance(raw_paths, str):
+        raw_paths = [raw_paths]
+    if not isinstance(raw_paths, list):
+        raise ValueError(
+            "A chave 'external_tdsx_paths' do config.json deve ser uma string ou uma lista de caminhos."
+        )
+    return [str(path) for path in raw_paths if str(path).strip()]
 
 
 def parse_args() -> argparse.Namespace:
@@ -1600,9 +3099,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--format",
         dest="output_format",
-        choices=["all", "markdown", "json", "excel"],
+        choices=["all", "markdown", "json", "excel", "rtf"],
         default="all",
-        help="Formato principal da documentação a gerar. O mapa XPath/JSON é sempre gerado.",
+        help="Formato principal da documentação a gerar. Em `markdown`, o script gera `.md` e `.rtf`. O mapa XPath/JSON é sempre gerado.",
     )
     return parser.parse_args()
 
@@ -1611,7 +3110,12 @@ def main() -> None:
     args = parse_args()
     try:
         file_path = args.filepath or load_path_from_config()
-        documenter = TableauDoc(file_path, output_format=args.output_format)
+        external_tdsx_paths = load_external_tdsx_paths_from_config()
+        documenter = TableauDoc(
+            file_path,
+            output_format=args.output_format,
+            external_tdsx_paths=external_tdsx_paths,
+        )
         written_files = documenter.write_outputs()
 
         print(f"Arquivo fonte: {documenter.source_path}")
@@ -1621,7 +3125,10 @@ def main() -> None:
             print(f"- {path}")
     except (FileNotFoundError, ValueError, ET.ParseError, zipfile.BadZipFile) as exc:
         print(f"Erro: {exc}")
-        print("Uso: python Tableau_doc.py <caminho_do_arquivo.twb|.twbx> [--format all|markdown|json|excel]")
+        print(
+            "Uso: python Tableau_doc.py <caminho_do_arquivo.twb|.twbx> "
+            "[--format all|markdown|json|excel|rtf]"
+        )
         sys.exit(1)
 
 
