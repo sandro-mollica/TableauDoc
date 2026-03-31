@@ -461,6 +461,7 @@ class TableauDoc:
         dashboards = self._extract_dashboards(worksheets)
         _log_progress(f"Dashboards extraídos: {len(dashboards)}.")
         self._enrich_usage(parameters, calculations, worksheets, dashboards)
+        self._enrich_datasource_field_usage(datasources, worksheets, calculations, parameters)
         _log_progress("Relações de uso entre parâmetros, cálculos, planilhas e dashboards enriquecidas.")
         stories = self._extract_stories()
         windows = self._extract_windows()
@@ -931,6 +932,7 @@ class TableauDoc:
             "default_format": column.get("default-format"),
             "aggregation": column.get("aggregation"),
             "hidden": column.get("hidden"),
+            "is_used": column.get("is-used") or column.get("is_used"),
             "value": column.get("value"),
             "param_domain_type": column.get("param-domain-type"),
             "semantic_role": column.get("semantic-role"),
@@ -1142,6 +1144,50 @@ class TableauDoc:
             calculation["used_in_worksheets"] = used_in_worksheets
             calculation["used_in_dashboards"] = used_in_dashboards
             calculation["is_used"] = bool(used_in_worksheets or used_in_dashboards)
+
+    def _enrich_datasource_field_usage(
+        self,
+        datasources: list[dict[str, Any]],
+        worksheets: list[dict[str, Any]],
+        calculations: list[dict[str, Any]],
+        parameters: list[dict[str, Any]],
+    ) -> None:
+        """Completa o indicador `is_used` dos campos da fonte com fallback baseado em referências reais."""
+        worksheet_xml = {
+            worksheet.get("name"): ET.tostring(element, encoding="unicode")
+            for worksheet, element in zip(
+                worksheets,
+                self.root.findall("./worksheets/worksheet"),
+            )
+        }
+        calculation_texts = [
+            calculation.get("formula_pretty") or calculation.get("formula") or ""
+            for calculation in calculations
+        ]
+        parameter_texts = [
+            " ".join(
+                filter(
+                    None,
+                    [
+                        parameter.get("source_field"),
+                        compact_json(parameter.get("source_field_details")) if parameter.get("source_field_details") else "",
+                    ],
+                )
+            )
+            for parameter in parameters
+        ]
+        reference_haystacks = list(worksheet_xml.values()) + calculation_texts + parameter_texts
+
+        for datasource in datasources:
+            for column in datasource.get("columns", []):
+                if column.get("is_used") is not None:
+                    continue
+                tokens = self._reference_tokens(column.get("name"), self._display_object_name(column))
+                column["is_used"] = any(
+                    token and token in haystack
+                    for token in tokens
+                    for haystack in reference_haystacks
+                )
 
     def _xml_contains_reference(self, xml_text: str, internal_name: str | None, caption: str | None) -> bool:
         """Busca referências de um campo no XML de uma worksheet."""
@@ -1827,6 +1873,45 @@ class TableauDoc:
         """Retorna o nome técnico/original do objeto para auditoria."""
         return item.get("name") or self._display_object_name(item)
 
+    def _is_measure_names_column(self, column: dict[str, Any]) -> bool:
+        """Identifica campos técnicos de Measure Names para escondê-los da listagem principal."""
+        internal_name = clean_brackets(column.get("name")) or ""
+        display_name = self._display_object_name(column)
+        candidates = {internal_name.strip().lower(), display_name.strip().lower()}
+        return any(value in {":measure names", "measure names"} for value in candidates)
+
+    def _display_column_label(self, column: dict[str, Any]) -> str:
+        """Monta o rótulo do campo com nome interno apenas quando ele agrega informação."""
+        display_name = self._display_object_name(column)
+        internal_name = clean_brackets(column.get("name"))
+        if not internal_name:
+            return display_name
+        if internal_name.strip().lower() == display_name.strip().lower():
+            return display_name
+        return f"{display_name} ({column.get('name')})"
+
+    def _group_datasource_columns(self, datasource: dict[str, Any]) -> list[tuple[str, list[dict[str, Any]]]]:
+        """Agrupa campos por tabela de origem usando `metadata-records` quando disponível."""
+        parent_name_by_column: dict[str, str] = {}
+        for record in datasource.get("metadata_records", []):
+            local_name = record.get("local_name")
+            parent_name = clean_brackets(record.get("parent_name"))
+            if local_name and parent_name and local_name not in parent_name_by_column:
+                parent_name_by_column[local_name] = parent_name
+
+        groups: dict[str, list[dict[str, Any]]] = {}
+        group_order: list[str] = []
+        for column in datasource.get("columns", []):
+            if self._is_measure_names_column(column):
+                continue
+            group_name = parent_name_by_column.get(column.get("name")) or "Tabela não identificada"
+            if group_name not in groups:
+                groups[group_name] = []
+                group_order.append(group_name)
+            groups[group_name].append(column)
+
+        return [(group_name, groups[group_name]) for group_name in group_order]
+
     def _collect_columns_from_dependencies(self, element: ET.Element) -> list[str]:
         columns = []
         for column in element.findall(".//datasource-dependencies/column"):
@@ -2108,23 +2193,26 @@ class TableauDoc:
             parts.append(self._rtf_bullet(f"Quantidade de cálculos na conexão: {len(datasource.get('connection_calculations', []))}", level=1))
             parts.append(self._rtf_bullet(f"Quantidade de objetos: {datasource.get('object_count')}", level=1))
             parts.append(self._rtf_paragraph("Campos da fonte de dados", style="body_bold", level=1))
-            if datasource.get("columns"):
-                for column in datasource.get("columns", []):
-                    column_name = self._display_object_name(column)
-                    parts.append(self._rtf_bullet(column_name, level=2))
-                    parts.append(self._rtf_bullet(f"Nome interno: {column.get('name')}", level=3))
-                    parts.append(self._rtf_bullet(f"Datatype: {column.get('datatype') or '-'}", level=3))
-                    parts.append(self._rtf_bullet(f"Role: {column.get('role') or '-'}", level=3))
-                    parts.append(self._rtf_bullet(f"Oculto: {format_yes_no(column.get('hidden'))}", level=3))
-                    alias_rows = self._format_aliases(column.get("aliases", []))
-                    parts.extend(
-                        self._rtf_list_block(
-                            "Aliases",
-                            alias_rows,
-                            level=3,
-                            empty_text="nenhum alias",
-                        )
-                    )
+            grouped_columns = self._group_datasource_columns(datasource)
+            if grouped_columns:
+                for table_name, columns in grouped_columns:
+                    parts.append(self._rtf_paragraph(table_name, style="body_bold", level=2))
+                    for column in columns:
+                        parts.append(self._rtf_bullet(self._display_column_label(column), level=3))
+                        parts.append(self._rtf_bullet(f"Datatype: {column.get('datatype') or '-'}", level=4))
+                        parts.append(self._rtf_bullet(f"Role: {column.get('role') or '-'}", level=4))
+                        parts.append(self._rtf_bullet(f"Em uso: {format_yes_no(column.get('is_used'))}", level=4))
+                        parts.append(self._rtf_bullet(f"Oculto: {format_yes_no(column.get('hidden'))}", level=4))
+                        alias_rows = self._format_aliases(column.get("aliases", []))
+                        if alias_rows:
+                            parts.extend(
+                                self._rtf_list_block(
+                                    "Aliases",
+                                    alias_rows,
+                                    level=4,
+                                    empty_text="nenhum alias",
+                                )
+                            )
             else:
                 parts.append(self._rtf_bullet("Nenhum campo identificado.", level=2))
             repo = datasource.get("repository_location") or {}
@@ -2448,38 +2536,48 @@ class TableauDoc:
                 parts.append(self._rtf_bullet(f"Role: {item.get('role') or '-'}", level=2))
                 parts.append(self._rtf_bullet(f"Datatype: {item.get('datatype') or '-'}", level=2))
                 parts.append(self._rtf_bullet(f"Type: {item.get('type') or '-'}", level=2))
+                parts.append(self._rtf_bullet(f"Em uso: {format_yes_no(item.get('is_used'))}", level=2))
                 parts.append(self._rtf_bullet(f"Oculto: {format_yes_no(item.get('hidden'))}", level=2))
-                parts.extend(
-                    self._rtf_list_block(
-                        "Aliases",
-                        self._format_aliases(item.get("aliases", [])),
-                        level=2,
-                        empty_text="nenhum alias",
+                alias_rows = self._format_aliases(item.get("aliases", []))
+                if alias_rows:
+                    parts.extend(
+                        self._rtf_list_block(
+                            "Aliases",
+                            alias_rows,
+                            level=2,
+                            empty_text="nenhum alias",
+                        )
                     )
-                )
-                parts.extend(
-                    self._rtf_list_block(
-                        "Impacta / é referenciado por",
-                        sorted(item.get("impacts", []), key=str.lower),
-                        level=2,
-                        empty_text="nenhum outro campo calculado",
+                impacts = sorted(item.get("impacts", []), key=str.lower)
+                if impacts:
+                    parts.extend(
+                        self._rtf_list_block(
+                            "Impacta / é referenciado por",
+                            impacts,
+                            level=2,
+                            empty_text="nenhum outro campo calculado",
+                        )
                     )
-                )
                 used_in_dashboards = sorted(item.get("used_in_dashboards", []), key=str.lower)
                 used_in_worksheets = sorted(item.get("used_in_worksheets", []), key=str.lower)
-                parts.extend(
-                    self._rtf_list_block(
-                        "Usado nos dashboards",
-                        used_in_dashboards,
-                        level=2,
-                        empty_text="não identificado",
+                if used_in_dashboards:
+                    parts.extend(
+                        self._rtf_list_block(
+                            "Usado nos dashboards",
+                            used_in_dashboards,
+                            level=2,
+                            empty_text="não identificado",
+                        )
                     )
-                )
                 if used_in_worksheets:
-                    for worksheet_name in used_in_worksheets:
-                        parts.append(self._rtf_bullet(f"Planilha: {worksheet_name}", level=2))
-                else:
-                    parts.append(self._rtf_bullet("Planilha: não identificado", level=2))
+                    parts.extend(
+                        self._rtf_list_block(
+                            "Usado nas planilhas",
+                            used_in_worksheets,
+                            level=2,
+                            empty_text="não identificado",
+                        )
+                    )
                 parts.append(self._rtf_bullet("Código:", level=2))
                 parts.append(self._rtf_code_block(item.get("codigo") or "-", level=3))
 
@@ -2492,15 +2590,7 @@ class TableauDoc:
             for item in unused_objects["calculations"]:
                 caption = self._display_object_name(item)
                 parts.append(self._rtf_bullet(caption, level=2))
-                parts.append(self._rtf_bullet(f"Nome real: {self._display_real_name(item)}", level=3))
-                parts.extend(
-                    self._rtf_list_block(
-                        "Aliases",
-                        self._format_aliases(item.get("aliases", [])),
-                        level=3,
-                        empty_text="nenhum alias",
-                    )
-                )
+                parts.append(self._rtf_bullet(f"Oculto: {format_yes_no(item.get('hidden'))}", level=3))
         else:
             parts.append(self._rtf_bullet("Nenhum campo calculado não usado identificado.", level=2))
 
@@ -2509,15 +2599,6 @@ class TableauDoc:
             for item in unused_objects["parameters"]:
                 caption = self._display_object_name(item)
                 parts.append(self._rtf_bullet(caption, level=2))
-                parts.append(self._rtf_bullet(f"Nome real: {self._display_real_name(item)}", level=3))
-                parts.extend(
-                    self._rtf_list_block(
-                        "Aliases",
-                        self._format_aliases(item.get("aliases", [])),
-                        level=3,
-                        empty_text="nenhum alias",
-                    )
-                )
         else:
             parts.append(self._rtf_bullet("Nenhum parâmetro não usado identificado.", level=2))
 
@@ -2526,7 +2607,6 @@ class TableauDoc:
             for item in unused_objects["datasources"]:
                 caption = self._display_object_name(item, allow_clean_brackets=False)
                 parts.append(self._rtf_bullet(caption, level=2))
-                parts.append(self._rtf_bullet(f"Nome real: {self._display_real_name(item)}", level=3))
         else:
             parts.append(self._rtf_bullet("Nenhuma fonte de dados não usada identificada.", level=2))
 
@@ -2696,22 +2776,22 @@ class TableauDoc:
                 lines.append(f"- ID: `{repo.get('id', '-')}`")
                 lines.append(f"- Revision: `{repo.get('revision', '-')}`")
             lines.append(f"- Quantidade de campos mapeados: {len(datasource.get('columns', []))}")
-            if datasource.get("columns"):
+            grouped_columns = self._group_datasource_columns(datasource)
+            if grouped_columns:
                 lines.append("- Campos da fonte de dados:")
-                for column in datasource.get("columns", []):
-                    column_name = self._display_object_name(column)
-                    lines.append(f"  - {column_name}")
-                    lines.append(f"    Nome interno: `{column.get('name')}`")
-                    lines.append(f"    Datatype: `{column.get('datatype') or '-'}`")
-                    lines.append(f"    Role: `{column.get('role') or '-'}`")
-                    lines.append(f"    Oculto: `{format_yes_no(column.get('hidden'))}`")
-                    alias_rows = self._format_aliases(column.get('aliases', []))
-                    if alias_rows:
-                        lines.append("    Aliases:")
-                        for alias in alias_rows:
-                            lines.append(f"      - {alias}")
-                    else:
-                        lines.append("    Aliases: nenhum alias")
+                for table_name, columns in grouped_columns:
+                    lines.append(f"  - {table_name}")
+                    for column in columns:
+                        lines.append(f"    - {self._display_column_label(column)}")
+                        lines.append(f"      Datatype: `{column.get('datatype') or '-'}`")
+                        lines.append(f"      Role: `{column.get('role') or '-'}`")
+                        lines.append(f"      Em uso: `{format_yes_no(column.get('is_used'))}`")
+                        lines.append(f"      Oculto: `{format_yes_no(column.get('hidden'))}`")
+                        alias_rows = self._format_aliases(column.get('aliases', []))
+                        if alias_rows:
+                            lines.append("      Aliases:")
+                            for alias in alias_rows:
+                                lines.append(f"        - {alias}")
             if custom_sql_relations:
                 lines.append("- SQL customizado encontrado no pacote: sim")
                 for index, relation in enumerate(custom_sql_relations, start=1):
@@ -2837,14 +2917,13 @@ class TableauDoc:
                 lines.append(f"- Campo: `{item.get('caption')}`")
                 lines.append(f"- Nome interno: `{item.get('name')}`")
                 lines.append(f"- Origem: `{item.get('origin')}`")
+                lines.append(f"- Em uso: `{format_yes_no(item.get('is_used'))}`")
                 lines.append(f"- Oculto: `{format_yes_no(item.get('hidden'))}`")
                 alias_rows = self._format_aliases(item.get("aliases", []))
                 if alias_rows:
                     lines.append("- Aliases:")
                     for alias in alias_rows:
                         lines.append(f"  - {alias}")
-                else:
-                    lines.append("- Aliases: nenhum alias")
                 codigo = item.get("codigo") or "-"
                 lines.append(f"- Código: {codigo}")
                 impacts = sorted(item.get("impacts", []), key=str.lower)
@@ -2852,20 +2931,14 @@ class TableauDoc:
                     lines.append("- Impacta / é referenciado por:")
                     for impact in impacts:
                         lines.append(f"  - {impact}")
-                else:
-                    lines.append("- Impacta / é referenciado por: nenhum outro campo calculado")
                 if item.get("used_in_dashboards"):
                     lines.append("- Usado nos painéis:")
                     for dashboard in sorted(item["used_in_dashboards"], key=str.lower):
                         lines.append(f"  - {dashboard}")
-                else:
-                    lines.append("- Usado nos painéis: não está sendo usado em nenhum painel")
                 if item.get("used_in_worksheets"):
                     lines.append("- Usado nas planilhas:")
                     for worksheet in sorted(item["used_in_worksheets"], key=str.lower):
                         lines.append(f"  - {worksheet}")
-                else:
-                    lines.append("- Usado nas planilhas: não está sendo usado em nenhuma planilha")
                 lines.append("")
         return lines
 
@@ -2879,14 +2952,7 @@ class TableauDoc:
             for item in unused_objects["calculations"]:
                 caption = self._display_object_name(item)
                 lines.append(f"- {caption}")
-                lines.append(f"  - Nome real: {self._display_real_name(item)}")
-                alias_rows = self._format_aliases(item.get("aliases", []))
-                if alias_rows:
-                    lines.append("  - Aliases:")
-                    for alias in alias_rows:
-                        lines.append(f"    - {alias}")
-                else:
-                    lines.append("  - Aliases: nenhum alias")
+                lines.append(f"  - Oculto: {format_yes_no(item.get('hidden'))}")
         else:
             lines.append("- Nenhum campo calculado não usado identificado.")
 
@@ -2897,14 +2963,6 @@ class TableauDoc:
             for item in unused_objects["parameters"]:
                 caption = self._display_object_name(item)
                 lines.append(f"- {caption}")
-                lines.append(f"  - Nome real: {self._display_real_name(item)}")
-                alias_rows = self._format_aliases(item.get("aliases", []))
-                if alias_rows:
-                    lines.append("  - Aliases:")
-                    for alias in alias_rows:
-                        lines.append(f"    - {alias}")
-                else:
-                    lines.append("  - Aliases: nenhum alias")
         else:
             lines.append("- Nenhum parâmetro não usado identificado.")
 
@@ -2915,7 +2973,6 @@ class TableauDoc:
             for item in unused_objects["datasources"]:
                 caption = self._display_object_name(item, allow_clean_brackets=False)
                 lines.append(f"- {caption}")
-                lines.append(f"  - Nome real: {self._display_real_name(item)}")
         else:
             lines.append("- Nenhuma fonte de dados não usada identificada.")
         lines.append("")

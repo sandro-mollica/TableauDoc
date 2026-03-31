@@ -1,4 +1,6 @@
 {
-	"tableau_path": "/Users/sandromollica/Library/CloudStorage/OneDrive-Pessoal/Trabalho/5Acts/Boehringer/CRM360/Painéis/Dashboard360CRM_20260327.twbx",
-	"external_tdsx_paths": []
+	"tableau_path": "/Users/sandromollica/Library/CloudStorage/OneDrive-Pessoal/Trabalho/5Acts/ECP/Paineis/Fala Pinheiros/Fala Pinheiros 20260219.twbx",
+	"external_tdsx_paths": [
+		"/Users/sandromollica/Fontes de Dados/Fala Pinheiros Manifestacoes.tdsx"
+	]
 }
