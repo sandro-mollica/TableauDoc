@@ -1,5 +1,7 @@
 # Documentação do Script `Tableau_doc.py`
 
+Observação: o projeto também inclui o launcher [PowerBI_doc.py](/Users/sandromollica/Library/CloudStorage/OneDrive-Pessoal/Workspaces/Antigravity/TableauDoc/PowerBI_doc.py) e a implementação [src/powerbi_doc.py](/Users/sandromollica/Library/CloudStorage/OneDrive-Pessoal/Workspaces/Antigravity/TableauDoc/src/powerbi_doc.py) para relatórios Power BI ` .pbix`, mas essa opção ainda está em desenvolvimento.
+
 ## Objetivo
 
 O launcher `Tableau_doc.py` na raiz encaminha a execução para a implementação principal em `src/tableau_doc.py`, responsável por extrair e documentar metadados de arquivos Tableau ` .twb` e ` .twbx` sem depender do Tableau Desktop.
@@ -49,6 +51,12 @@ Observações sobre geração por formato:
 python3 Tableau_doc.py /caminho/arquivo.twbx --format all
 ```
 
+Fluxo alternativo em desenvolvimento para Power BI:
+
+```bash
+python3 PowerBI_doc.py /caminho/arquivo.pbix --format all
+```
+
 ### Opções de `--format`
 
 - `markdown`
@@ -57,6 +65,8 @@ python3 Tableau_doc.py /caminho/arquivo.twbx --format all
 - `rtf`
 - `docx`
 - `all`
+
+As mesmas opções de formato também existem no fluxo de Power BI, com cobertura ainda em evolução.
 
 ## Configuração
 

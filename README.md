@@ -2,10 +2,14 @@
 
 Ferramenta em Python para documentar workbooks Tableau ` .twb` e ` .twbx` sem abrir o Tableau Desktop.
 
+O projeto também já inclui uma opção para documentar arquivos Power BI ` .pbix`, mas essa frente ainda está em desenvolvimento e pode ter cobertura parcial dependendo da estrutura do relatório.
+
 ## Arquivos principais
 
 - [Tableau_doc.py](/Users/sandromollica/Library/CloudStorage/OneDrive-Pessoal/Workspaces/Antigravity/TableauDoc/Tableau_doc.py): launcher de compatibilidade na raiz
 - [src/tableau_doc.py](/Users/sandromollica/Library/CloudStorage/OneDrive-Pessoal/Workspaces/Antigravity/TableauDoc/src/tableau_doc.py): implementação principal
+- [PowerBI_doc.py](/Users/sandromollica/Library/CloudStorage/OneDrive-Pessoal/Workspaces/Antigravity/TableauDoc/PowerBI_doc.py): launcher de compatibilidade para Power BI
+- [src/powerbi_doc.py](/Users/sandromollica/Library/CloudStorage/OneDrive-Pessoal/Workspaces/Antigravity/TableauDoc/src/powerbi_doc.py): implementação atual da extração para Power BI
 - [requirements.txt](/Users/sandromollica/Library/CloudStorage/OneDrive-Pessoal/Workspaces/Antigravity/TableauDoc/requirements.txt): dependências Python
 - [docs/SCRIPT_DOCUMENTATION.md](/Users/sandromollica/Library/CloudStorage/OneDrive-Pessoal/Workspaces/Antigravity/TableauDoc/docs/SCRIPT_DOCUMENTATION.md): documentação funcional e técnica do script
 - [docs/ROUTINE_REFERENCE.md](/Users/sandromollica/Library/CloudStorage/OneDrive-Pessoal/Workspaces/Antigravity/TableauDoc/docs/ROUTINE_REFERENCE.md): referência detalhada das rotinas e responsabilidades internas
@@ -20,6 +24,8 @@ pip install -r requirements.txt
 
 ## Uso
 
+### Tableau
+
 ```bash
 python3 Tableau_doc.py /caminho/arquivo.twbx --format all
 python3 Tableau_doc.py /caminho/arquivo.twbx --format markdown
@@ -28,6 +34,21 @@ python3 Tableau_doc.py /caminho/arquivo.twbx --format excel
 python3 Tableau_doc.py /caminho/arquivo.twbx --format rtf
 python3 Tableau_doc.py /caminho/arquivo.twbx --format docx
 ```
+
+### Power BI
+
+Status atual: em desenvolvimento.
+
+```bash
+python3 PowerBI_doc.py /caminho/arquivo.pbix --format all
+python3 PowerBI_doc.py /caminho/arquivo.pbix --format markdown
+python3 PowerBI_doc.py /caminho/arquivo.pbix --format json
+python3 PowerBI_doc.py /caminho/arquivo.pbix --format excel
+python3 PowerBI_doc.py /caminho/arquivo.pbix --format rtf
+python3 PowerBI_doc.py /caminho/arquivo.pbix --format docx
+```
+
+O suporte a Power BI ainda não tem o mesmo nível de maturidade da documentação Tableau. Use essa opção como experimental, especialmente para relatórios com modelos mais complexos ou empacotamentos menos padronizados.
 
 ## Leitura opcional de `.tdsx` externo
 
@@ -81,6 +102,8 @@ data/<nome-do-arquivo>/
 
 Esse diretório é criado na raiz do projeto, independentemente do diretório atual de execução.
 
+Para Power BI, a pasta de saída segue a mesma convenção, com base no nome do arquivo ` .pbix`.
+
 ## Estrutura sugerida
 
 ```text
@@ -89,13 +112,15 @@ TableauDoc/
 │  └─ config.json
 ├─ src/
 │  ├─ __init__.py
-│  └─ tableau_doc.py
+│  ├─ tableau_doc.py
+│  └─ powerbi_doc.py
 ├─ docs/
 │  ├─ ROUTINE_REFERENCE.md
 │  └─ SCRIPT_DOCUMENTATION.md
 ├─ data/
 ├─ TableauDoc.code-workspace
 ├─ Tableau_doc.py
+├─ PowerBI_doc.py
 ├─ README.md
 ├─ requirements.txt
 └─ .gitignore
@@ -109,6 +134,8 @@ TableauDoc/
 - `--format rtf`: gera `xml`, `mapa_XPath_JSON.*` e `rtf`
 - `--format docx`: gera `xml`, `mapa_XPath_JSON.*` e `docx`
 - `--format all`: gera `xml`, `mapa_XPath_JSON.*`, `json`, `md`, `rtf`, `docx`, `xlsx` e o manifesto
+
+Os mesmos formatos também estão disponíveis no fluxo de Power BI. Nessa opção, porém, a cobertura funcional ainda está em desenvolvimento.
 
 ## O que o script documenta
 
@@ -149,3 +176,4 @@ TableauDoc/
 - arquivos ` .hyper` não são copiados para `data/`
 - artefatos temporários de processamento são removidos automaticamente ao final da execução
 - a data de última alteração do workbook é exibida no resumo do relatório
+- o suporte a Power BI deve ser tratado como experimental até a cobertura documental ficar equivalente à de Tableau
