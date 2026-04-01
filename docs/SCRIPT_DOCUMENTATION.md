@@ -6,6 +6,8 @@ O launcher `Tableau_doc.py` na raiz encaminha a execução para a implementaçã
 
 Ele transforma o workbook em artefatos legíveis para análise, auditoria e documentação técnica.
 
+Para uma descrição aprofundada de cada função e método, consulte [docs/ROUTINE_REFERENCE.md](/Users/sandromollica/Library/CloudStorage/OneDrive-Pessoal/Workspaces/Antigravity/TableauDoc/docs/ROUTINE_REFERENCE.md).
+
 ## Entradas suportadas
 
 - ` .twb`
@@ -26,10 +28,20 @@ Os arquivos são gravados sempre em:
 - `mapa_XPath_JSON.json`
 - `<arquivo>.md`
 - `<arquivo>.rtf`
+- `<arquivo>.docx`
 - `<arquivo>.json`
 - `<arquivo>.xlsx`
 - `<arquivo>_manifest.json`
 - `thumbnails/`
+
+Observações sobre geração por formato:
+
+- `markdown` gera `<arquivo>.md` e `<arquivo>.rtf`
+- `rtf` gera apenas `<arquivo>.rtf`
+- `docx` gera apenas `<arquivo>.docx`
+- `json` gera apenas `<arquivo>.json`
+- `excel` gera apenas `<arquivo>.xlsx`
+- `all` gera todos os artefatos finais acima, além do manifesto
 
 ## Parâmetros de execução
 
@@ -43,6 +55,7 @@ python3 Tableau_doc.py /caminho/arquivo.twbx --format all
 - `json`
 - `excel`
 - `rtf`
+- `docx`
 - `all`
 
 ## Configuração
@@ -110,7 +123,8 @@ Se houver mais de um `.tdsx`, o script percorre todos os caminhos informados e t
 6. gera o mapa XPath/JSON
 7. gera a documentação no formato solicitado
 8. quando o formato é `markdown`, gera em conjunto os arquivos `md` e `rtf`
-9. remove artefatos temporários de processamento
+9. quando o formato é `docx`, monta o relatório Word diretamente a partir da estrutura interna de blocos do documento
+10. remove artefatos temporários de processamento
 
 ## Estruturas extraídas
 
@@ -224,10 +238,28 @@ Isso é usado em:
 
 O relatório `.rtf` usa:
 
-- `Calibre` como fonte principal
+- `Arial` como fonte principal
 - uma fonte monoespaçada padrão do sistema para código de campos calculados e valores hexadecimais
 
 Os nomes das fontes ficam explícitos no código para facilitar personalização.
+
+### Geração do DOCX
+
+O relatório `.docx` é gerado com `python-docx` e reaproveita a mesma estrutura lógica usada pelo relatório `.rtf`.
+
+Isso significa que os dois formatos compartilham:
+
+- título principal e carimbo de geração
+- seções, subseções e subtítulos internos
+- bullets com níveis de indentação equivalentes
+- blocos monoespaçados para código de campos calculados e diagramas textuais
+
+Configuração atual aplicada ao `.docx`:
+
+- fonte do corpo: `Arial`
+- fonte monoespaçada: `Courier New`
+- tamanho base do texto: `10 pt`
+- título do documento Word preenchido nas propriedades do arquivo
 
 ## Limitações conhecidas
 
@@ -240,3 +272,4 @@ Os nomes das fontes ficam explícitos no código para facilitar personalização
 
 - `pandas`
 - `openpyxl`
+- `python-docx`

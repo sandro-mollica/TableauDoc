@@ -7,7 +7,7 @@ Fluxo principal:
 - extrai o XML do workbook e, quando necessário, o conteúdo do pacote `.twbx`;
 - monta um conjunto consolidado de metadados sobre fontes, planilhas, dashboards,
   parâmetros, cálculos e elementos visuais;
-- gera artefatos de documentação em Markdown, RTF, JSON e/ou Excel;
+- gera artefatos de documentação em Markdown, RTF, DOCX, JSON e/ou Excel;
 - opcionalmente complementa a leitura com um ou mais `.tdsx` externos definidos no
   `config/config.json`.
 
@@ -17,6 +17,7 @@ Exemplos:
 - `python3 Tableau_doc.py /caminho/arquivo.twbx --format json`
 - `python3 Tableau_doc.py /caminho/arquivo.twbx --format excel`
 - `python3 Tableau_doc.py /caminho/arquivo.twbx --format rtf`
+- `python3 Tableau_doc.py /caminho/arquivo.twbx --format docx`
 """
 
 from __future__ import annotations
@@ -35,6 +36,11 @@ from typing import Any
 import xml.etree.ElementTree as ET
 
 import pandas as pd
+from docx import Document
+from docx.enum.text import WD_TAB_ALIGNMENT
+from docx.oxml import OxmlElement
+from docx.oxml.ns import qn
+from docx.shared import Cm, Pt
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 PROJECT_ROOT = SCRIPT_DIR.parent
@@ -47,8 +53,10 @@ TEMPORARY_OUTPUT_NAMES = {
 }
 
 # Fontes do documento RTF. Ajuste aqui caso queira personalizar a tipografia.
-RTF_BODY_FONT_NAME = "Calibre"
+RTF_BODY_FONT_NAME = "Arial"
 RTF_MONO_FONT_NAME = "Courier New"
+DOCX_BODY_FONT_NAME = RTF_BODY_FONT_NAME
+DOCX_MONO_FONT_NAME = RTF_MONO_FONT_NAME
 TABLEAU_IMPLICIT_FONT_LABEL = "Fonte padrão do Tableau (não explicitada no XML)"
 SHOW_WORKSHEET_SHELF_COLUMNS_IN_RTF = False
 SHOW_FILTER_GROUP_VALUES_IN_RTF = False
@@ -351,6 +359,7 @@ class TableauDoc:
 
         self.root = self._load_root_and_extract_contents()
         self.metadata = self._build_metadata()
+        self._augment_summary_metrics()
 
     def _load_root_and_extract_contents(self) -> ET.Element:
         """Lê o XML principal e salva o conteúdo bruto do workbook no diretório de saída."""
@@ -499,6 +508,27 @@ class TableauDoc:
                 "package_member_count": len(self.package_manifest),
             },
         }
+
+    def _augment_summary_metrics(self) -> None:
+        """Complementa o resumo com contadores derivados usados nos relatórios."""
+        summary = self.metadata.setdefault("summary", {})
+        unused_objects = self._collect_unused_objects()
+        summary["worksheet_independent_count"] = self._count_independent_worksheets()
+        summary["unused_calculation_count"] = len(unused_objects["calculations"])
+        summary["unused_parameter_count"] = len(unused_objects["parameters"])
+
+    def _count_independent_worksheets(self) -> int:
+        """Conta worksheets que não aparecem associadas a nenhum dashboard."""
+        associated_worksheets = {
+            worksheet_name
+            for dashboard in self.metadata.get("dashboards", [])
+            for worksheet_name in dashboard.get("worksheet_members", [])
+        }
+        return sum(
+            1
+            for worksheet in self.metadata.get("worksheets", [])
+            if worksheet.get("name") not in associated_worksheets
+        )
 
     def _build_caption_lookup(self, datasources: list[dict[str, Any]]) -> None:
         """Monta um mapa global entre nomes internos e captions amigáveis."""
@@ -2041,6 +2071,8 @@ class TableauDoc:
             written_files.append(self._write_rtf())
         if self.output_format == "rtf":
             written_files.append(self._write_rtf())
+        if self.output_format in {"all", "docx"}:
+            written_files.append(self._write_docx())
         if self.output_format in {"all", "excel"}:
             written_files.append(self._write_excel())
 
@@ -2096,6 +2128,7 @@ class TableauDoc:
     def _write_markdown(self) -> Path:
         output_path = self.output_dir / f"{self.base_name}.md"
         _log_progress(f"Gerando arquivo Markdown `{output_path.name}`.")
+        summary = self.metadata["summary"]
         lines = [
             f"# Documentação do Workbook Tableau - {self.source_path.name}",
             "",
@@ -2106,11 +2139,11 @@ class TableauDoc:
             f"- Caminho de origem: `{self.source_path}`",
             f"- Tipo do arquivo: `{self.source_path.suffix.lower()}`",
             f"- Última alteração do arquivo: `{self.metadata['workbook']['source_file_last_modified']}`",
-            f"- Datasources: {self.metadata['summary']['datasource_count']}",
-            f"- Parâmetros: {self.metadata['summary']['parameter_count']}",
-            f"- Campos calculados: {self.metadata['summary']['calculation_count']}",
-            f"- Worksheets: {self.metadata['summary']['worksheet_count']}",
-            f"- Dashboards: {self.metadata['summary']['dashboard_count']}",
+            f"- Datasources: {summary['datasource_count']}",
+            f"- Parâmetros: {summary['parameter_count']} ({summary['unused_parameter_count']} não usados e não referenciados)",
+            f"- Campos calculados: {summary['calculation_count']} ({summary['unused_calculation_count']} não usados e não referenciados)",
+            f"- Worksheets: {summary['worksheet_count']} ({summary['worksheet_independent_count']} independentes)",
+            f"- Dashboards: {summary['dashboard_count']}",
             "",
             "## Workbook",
             "",
@@ -2142,36 +2175,70 @@ class TableauDoc:
         output_path.write_text(header + body + "}", encoding="utf-8")
         return output_path
 
+    def _write_docx(self) -> Path:
+        output_path = self.output_dir / f"{self.base_name}.docx"
+        _log_progress(f"Gerando arquivo DOCX `{output_path.name}`.")
+        document = Document()
+        self._configure_docx_document(document)
+        blocks = self._build_document_blocks()
+        title_block_count = 2 if len(blocks) >= 2 else len(blocks)
+        for block in blocks[:title_block_count]:
+            self._append_docx_block(document, block)
+        if blocks:
+            spacer = document.add_paragraph()
+            self._apply_docx_paragraph_format(spacer)
+            self._append_docx_toc(document)
+            document.add_page_break()
+        for block in blocks[title_block_count:]:
+            self._append_docx_block(document, block)
+        document.save(output_path)
+        return output_path
+
     def _build_rtf_document(self) -> str:
-        parts: list[str] = []
+        return "".join(self._render_rtf_block(block) for block in self._build_document_blocks())
+
+    def _build_document_blocks(self) -> list[dict[str, Any]]:
+        parts: list[dict[str, Any]] = []
         summary = self.metadata["summary"]
         workbook = self.metadata["workbook"]
 
-        parts.append(self._rtf_paragraph(f"Documentação do Workbook Tableau - {self.source_path.name}", style="title"))
-        parts.append(self._rtf_paragraph(f"Relatório gerado em {self.generated_at}", style="body"))
+        parts.append(self._doc_paragraph(f"Documentação do Workbook Tableau - {self.source_path.name}", style="title"))
+        parts.append(self._doc_paragraph(f"Relatório gerado em {self.generated_at}", style="subtitle"))
 
-        parts.append(self._rtf_paragraph("Seção de dados gerais", style="section"))
-        parts.append(self._rtf_paragraph("Resumo", style="subsection"))
-        parts.append(self._rtf_bullet(f"Caminho de origem: {self.source_path}"))
-        parts.append(self._rtf_bullet(f"Tipo do arquivo: {self.source_path.suffix.lower()}"))
-        parts.append(self._rtf_bullet(f"Última alteração do arquivo: {workbook['source_file_last_modified']}"))
-        parts.append(self._rtf_bullet(f"Datasources: {summary['datasource_count']}"))
-        parts.append(self._rtf_bullet(f"Parâmetros: {summary['parameter_count']}"))
-        parts.append(self._rtf_bullet(f"Campos calculados: {summary['calculation_count']}"))
-        parts.append(self._rtf_bullet(f"Worksheets: {summary['worksheet_count']}"))
-        parts.append(self._rtf_bullet(f"Dashboards: {summary['dashboard_count']}"))
-        parts.append(self._rtf_bullet(f"Itens do pacote: {summary['package_member_count']}"))
+        parts.append(self._doc_paragraph("Seção de dados gerais", style="section"))
+        parts.append(self._doc_paragraph("Resumo", style="subsection"))
+        parts.append(self._doc_bullet(f"Caminho de origem: {self.source_path}"))
+        parts.append(self._doc_bullet(f"Tipo do arquivo: {self.source_path.suffix.lower()}"))
+        parts.append(self._doc_bullet(f"Última alteração do arquivo: {workbook['source_file_last_modified']}"))
+        parts.append(self._doc_bullet(f"Datasources: {summary['datasource_count']}"))
+        parts.append(
+            self._doc_bullet(
+                f"Parâmetros: {summary['parameter_count']} ({summary['unused_parameter_count']} não usados e não referenciados)"
+            )
+        )
+        parts.append(
+            self._doc_bullet(
+                f"Campos calculados: {summary['calculation_count']} ({summary['unused_calculation_count']} não usados e não referenciados)"
+            )
+        )
+        parts.append(
+            self._doc_bullet(
+                f"Worksheets: {summary['worksheet_count']} ({summary['worksheet_independent_count']} independentes)"
+            )
+        )
+        parts.append(self._doc_bullet(f"Dashboards: {summary['dashboard_count']}"))
+        parts.append(self._doc_bullet(f"Itens do pacote: {summary['package_member_count']}"))
 
-        parts.append(self._rtf_paragraph("Workbook", style="subsection"))
-        parts.append(self._rtf_bullet(f"Arquivo no pacote: {workbook.get('package_workbook_name') or '-'}"))
+        parts.append(self._doc_paragraph("Workbook", style="subsection"))
+        parts.append(self._doc_bullet(f"Arquivo no pacote: {workbook.get('package_workbook_name') or '-'}"))
         for key, value in workbook.get("attributes", {}).items():
-            parts.append(self._rtf_bullet(f"{key}: {value}"))
+            parts.append(self._doc_bullet(f"{key}: {value}"))
 
-        parts.append(self._rtf_paragraph("Seção Fontes de dados", style="section"))
-        parts.append(self._rtf_paragraph("Fontes de dados", style="subsection"))
+        parts.append(self._doc_paragraph("Seção Fontes de dados", style="section"))
+        parts.append(self._doc_paragraph("Fontes de dados", style="subsection"))
         datasources = self.metadata["datasources"]
         if not datasources:
-            parts.append(self._rtf_bullet("Nenhuma fonte de dados identificada."))
+            parts.append(self._doc_bullet("Nenhuma fonte de dados identificada."))
         for datasource in datasources:
             ds_name = datasource.get("caption") or datasource.get("name") or "(sem nome)"
             datasource_type = self._infer_datasource_type(datasource)
@@ -2182,31 +2249,31 @@ class TableauDoc:
             relationship_maps = self._dedupe_relationship_maps(
                 (datasource.get("relationship_maps") or []) + (datasource.get("external_relationship_maps") or [])
             )
-            parts.append(self._rtf_paragraph(ds_name, style="subsubsection"))
-            parts.append(self._rtf_bullet(f"Tipo: {datasource_type}", level=1))
-            parts.append(self._rtf_bullet(f"Versão: {datasource.get('version')}", level=1))
-            parts.append(self._rtf_bullet(f"Inline: {datasource.get('inline')}", level=1))
-            parts.append(self._rtf_bullet(f"Has connection: {datasource.get('hasconnection')}", level=1))
-            parts.append(self._rtf_bullet(f"Quantidade de conexões: {len(datasource.get('connections', []))}", level=1))
-            parts.append(self._rtf_bullet(f"Quantidade de campos: {len(datasource.get('columns', []))}", level=1))
-            parts.append(self._rtf_bullet(f"Quantidade de metadata records: {len(datasource.get('metadata_records', []))}", level=1))
-            parts.append(self._rtf_bullet(f"Quantidade de cálculos na conexão: {len(datasource.get('connection_calculations', []))}", level=1))
-            parts.append(self._rtf_bullet(f"Quantidade de objetos: {datasource.get('object_count')}", level=1))
-            parts.append(self._rtf_paragraph("Campos da fonte de dados", style="body_bold", level=1))
+            parts.append(self._doc_paragraph(ds_name, style="subsubsection"))
+            parts.append(self._doc_bullet(f"Tipo: {datasource_type}", level=1))
+            parts.append(self._doc_bullet(f"Versão: {datasource.get('version')}", level=1))
+            parts.append(self._doc_bullet(f"Inline: {datasource.get('inline')}", level=1))
+            parts.append(self._doc_bullet(f"Has connection: {datasource.get('hasconnection')}", level=1))
+            parts.append(self._doc_bullet(f"Quantidade de conexões: {len(datasource.get('connections', []))}", level=1))
+            parts.append(self._doc_bullet(f"Quantidade de campos: {len(datasource.get('columns', []))}", level=1))
+            parts.append(self._doc_bullet(f"Quantidade de metadata records: {len(datasource.get('metadata_records', []))}", level=1))
+            parts.append(self._doc_bullet(f"Quantidade de cálculos na conexão: {len(datasource.get('connection_calculations', []))}", level=1))
+            parts.append(self._doc_bullet(f"Quantidade de objetos: {datasource.get('object_count')}", level=1))
+            parts.append(self._doc_paragraph("Campos da fonte de dados", style="body_bold", level=1))
             grouped_columns = self._group_datasource_columns(datasource)
             if grouped_columns:
                 for table_name, columns in grouped_columns:
-                    parts.append(self._rtf_paragraph(table_name, style="body_bold", level=2))
+                    parts.append(self._doc_paragraph(table_name, style="body_bold", level=2))
                     for column in columns:
-                        parts.append(self._rtf_bullet(self._display_column_label(column), level=3))
-                        parts.append(self._rtf_bullet(f"Datatype: {column.get('datatype') or '-'}", level=4))
-                        parts.append(self._rtf_bullet(f"Role: {column.get('role') or '-'}", level=4))
-                        parts.append(self._rtf_bullet(f"Em uso: {format_yes_no(column.get('is_used'))}", level=4))
-                        parts.append(self._rtf_bullet(f"Oculto: {format_yes_no(column.get('hidden'))}", level=4))
+                        parts.append(self._doc_bullet(self._display_column_label(column), level=3))
+                        parts.append(self._doc_bullet(f"Datatype: {column.get('datatype') or '-'}", level=4))
+                        parts.append(self._doc_bullet(f"Role: {column.get('role') or '-'}", level=4))
+                        parts.append(self._doc_bullet(f"Em uso: {format_yes_no(column.get('is_used'))}", level=4))
+                        parts.append(self._doc_bullet(f"Oculto: {format_yes_no(column.get('hidden'))}", level=4))
                         alias_rows = self._format_aliases(column.get("aliases", []))
                         if alias_rows:
                             parts.extend(
-                                self._rtf_list_block(
+                                self._doc_list_block(
                                     "Aliases",
                                     alias_rows,
                                     level=4,
@@ -2214,19 +2281,19 @@ class TableauDoc:
                                 )
                             )
             else:
-                parts.append(self._rtf_bullet("Nenhum campo identificado.", level=2))
+                parts.append(self._doc_bullet("Nenhum campo identificado.", level=2))
             repo = datasource.get("repository_location") or {}
             if repo:
-                parts.append(self._rtf_paragraph("Localização publicada", style="body_bold", level=1))
+                parts.append(self._doc_paragraph("Localização publicada", style="body_bold", level=1))
                 for key, value in repo.items():
-                    parts.append(self._rtf_bullet(f"{key}: {value}", level=2))
+                    parts.append(self._doc_bullet(f"{key}: {value}", level=2))
             for index, connection in enumerate(datasource.get("connections", []), start=1):
-                parts.append(self._rtf_paragraph(f"Conexão {index}", style="body_bold", level=1))
-                parts.append(self._rtf_bullet(f"Atributos: {compact_json(connection.get('attributes'))}", level=2))
-                parts.append(self._rtf_bullet(f"Modo da conexão: {connection.get('mode') or '-'}", level=2))
+                parts.append(self._doc_paragraph(f"Conexão {index}", style="body_bold", level=1))
+                parts.append(self._doc_bullet(f"Atributos: {compact_json(connection.get('attributes'))}", level=2))
+                parts.append(self._doc_bullet(f"Modo da conexão: {connection.get('mode') or '-'}", level=2))
                 if connection.get("hyper_paths"):
                     parts.extend(
-                        self._rtf_list_block(
+                        self._doc_list_block(
                             "Arquivos .hyper associados",
                             connection.get("hyper_paths", []),
                             level=2,
@@ -2235,65 +2302,65 @@ class TableauDoc:
                     )
                 connection_diagram = self._build_connection_diagram(connection, relationship_maps=relationship_maps)
                 if connection_diagram:
-                    parts.append(self._rtf_bullet("Estrutura da conexão:", level=2))
-                    parts.append(self._rtf_code_block(connection_diagram, level=3))
+                    parts.append(self._doc_bullet("Estrutura da conexão:", level=2))
+                    parts.append(self._doc_code_block(connection_diagram, level=3))
                 connection_sql = next(
                     (item for item in package_custom_sql_by_connection if item.get("connection_index") == index),
                     None,
                 )
                 if connection_sql:
-                    parts.append(self._rtf_bullet("SQL customizado:", level=2))
-                    parts.append(self._rtf_code_block(connection_sql["custom_sql"], level=3))
+                    parts.append(self._doc_bullet("SQL customizado:", level=2))
+                    parts.append(self._doc_code_block(connection_sql["custom_sql"], level=3))
             if not package_custom_sql_by_connection:
-                parts.append(self._rtf_bullet("SQL customizado encontrado no pacote: não", level=1))
+                parts.append(self._doc_bullet("SQL customizado encontrado no pacote: não", level=1))
             if external_custom_sql_relations:
-                parts.append(self._rtf_bullet("SQL customizado encontrado em `.tdsx` externo: sim", level=1))
+                parts.append(self._doc_bullet("SQL customizado encontrado em `.tdsx` externo: sim", level=1))
                 for relation in external_custom_sql_relations:
                     relation_name = relation.get("relation_name") or "(sem nome)"
                     parts.append(
-                        self._rtf_bullet(
+                        self._doc_bullet(
                             f"Origem externa: {relation.get('tdsx_path')} | relation: {relation_name}",
                             level=2,
                         )
                     )
-                    parts.append(self._rtf_bullet("SQL externo:", level=2))
-                    parts.append(self._rtf_code_block(relation["custom_sql"], level=3))
+                    parts.append(self._doc_bullet("SQL externo:", level=2))
+                    parts.append(self._doc_code_block(relation["custom_sql"], level=3))
             elif datasource.get("external_tdsx_matches"):
-                parts.append(self._rtf_bullet("SQL customizado encontrado em `.tdsx` externo: não", level=1))
+                parts.append(self._doc_bullet("SQL customizado encontrado em `.tdsx` externo: não", level=1))
             if relationship_maps:
-                parts.append(self._rtf_paragraph("Mapa de relacionamentos", style="body_bold", level=1))
+                parts.append(self._doc_paragraph("Mapa de relacionamentos", style="body_bold", level=1))
                 for relation in relationship_maps:
                     from_label = relation.get("from_label") or "(sem origem)"
                     to_label = relation.get("to_label") or "(sem destino)"
-                    parts.append(self._rtf_bullet(f"{from_label} -> {to_label}", level=2))
-                    parts.append(self._rtf_bullet(f"Condição: {relation.get('expression') or '-'}", level=3))
+                    parts.append(self._doc_bullet(f"{from_label} -> {to_label}", level=2))
+                    parts.append(self._doc_bullet(f"Condição: {relation.get('expression') or '-'}", level=3))
                     if relation.get("from_field"):
-                        parts.append(self._rtf_bullet(f"Campo de ligação na origem: {relation.get('from_field')}", level=3))
+                        parts.append(self._doc_bullet(f"Campo de ligação na origem: {relation.get('from_field')}", level=3))
                     if relation.get("to_field"):
-                        parts.append(self._rtf_bullet(f"Campo de ligação no destino: {relation.get('to_field')}", level=3))
+                        parts.append(self._doc_bullet(f"Campo de ligação no destino: {relation.get('to_field')}", level=3))
                     relation_sources = relation.get("sources") or ([relation.get("source")] if relation.get("source") else [])
                     if relation_sources:
-                        parts.append(self._rtf_bullet(f"Origem: {', '.join(relation_sources)}", level=3))
+                        parts.append(self._doc_bullet(f"Origem: {', '.join(relation_sources)}", level=3))
                     from_attrs = relation.get("from_attributes") or {}
                     to_attrs = relation.get("to_attributes") or {}
                     if from_attrs:
-                        parts.append(self._rtf_bullet(f"Atributos de origem: {compact_json(from_attrs)}", level=3))
+                        parts.append(self._doc_bullet(f"Atributos de origem: {compact_json(from_attrs)}", level=3))
                     if to_attrs:
-                        parts.append(self._rtf_bullet(f"Atributos de destino: {compact_json(to_attrs)}", level=3))
+                        parts.append(self._doc_bullet(f"Atributos de destino: {compact_json(to_attrs)}", level=3))
 
-        parts.append(self._rtf_paragraph("Seção de Dashboards", style="section"))
-        parts.append(self._rtf_paragraph("Dashboards", style="subsection"))
+        parts.append(self._doc_paragraph("Seção de Dashboards", style="section"))
+        parts.append(self._doc_paragraph("Dashboards", style="subsection"))
         dashboards = self.metadata["dashboards"]
         if not dashboards:
-            parts.append(self._rtf_bullet("Nenhum dashboard encontrado."))
+            parts.append(self._doc_bullet("Nenhum dashboard encontrado."))
         for dashboard in dashboards:
             dashboard_name = dashboard.get("name") or "(sem nome)"
-            parts.append(self._rtf_paragraph(dashboard_name, style="subsubsection"))
+            parts.append(self._doc_paragraph(dashboard_name, style="subsubsection"))
 
-            parts.append(self._rtf_paragraph("Planilhas", style="body_bold", level=1))
+            parts.append(self._doc_paragraph("Planilhas", style="body_bold", level=1))
             worksheet_members = dashboard.get("worksheet_members") or []
             if not worksheet_members:
-                parts.append(self._rtf_bullet("Nenhuma planilha identificada.", level=2))
+                parts.append(self._doc_bullet("Nenhuma planilha identificada.", level=2))
             for worksheet_name in worksheet_members:
                 worksheet = next((item for item in self.metadata["worksheets"] if item.get("name") == worksheet_name), None)
                 calculations_used = self._worksheet_calculation_labels(worksheet_name)
@@ -2305,11 +2372,11 @@ class TableauDoc:
                     ],
                     key=str.lower,
                 )
-                parts.append(self._rtf_paragraph(worksheet_name, style="body_bold", level=2))
+                parts.append(self._doc_paragraph(worksheet_name, style="body_bold", level=2))
                 if worksheet and worksheet.get("title"):
-                    parts.append(self._rtf_bullet(f"Título formatado: {compact_json(worksheet.get('title'))}", level=3))
+                    parts.append(self._doc_bullet(f"Título formatado: {compact_json(worksheet.get('title'))}", level=3))
                 parts.extend(
-                    self._rtf_list_block(
+                    self._doc_list_block(
                         "Datasources dependentes",
                         [
                             self._humanize_datasource_reference(value) or value
@@ -2319,175 +2386,175 @@ class TableauDoc:
                         empty_text="-",
                     )
                 )
-                parts.append(self._rtf_bullet("Campos referenciados:", level=3))
+                parts.append(self._doc_bullet("Campos referenciados:", level=3))
                 referenced_columns = worksheet.get("referenced_columns", []) if worksheet else []
                 if referenced_columns:
                     for referenced_column in referenced_columns:
-                        parts.append(self._rtf_bullet(referenced_column, level=4))
+                        parts.append(self._doc_bullet(referenced_column, level=4))
                 else:
-                    parts.append(self._rtf_bullet("Nenhum campo referenciado identificado.", level=4))
+                    parts.append(self._doc_bullet("Nenhum campo referenciado identificado.", level=4))
                 if SHOW_WORKSHEET_SHELF_COLUMNS_IN_RTF:
                     parts.append(
-                        self._rtf_bullet(
+                        self._doc_bullet(
                             f"Campos em shelves: {', '.join(worksheet.get('shelf_columns', [])) if worksheet else '-'}",
                             level=3,
                         )
                     )
 
-                parts.append(self._rtf_paragraph("Campos calculados", style="body_bold", level=3))
+                parts.append(self._doc_paragraph("Campos calculados", style="body_bold", level=3))
                 if calculations_used:
                     for calculation_name in calculations_used:
-                        parts.append(self._rtf_bullet(calculation_name, level=4))
+                        parts.append(self._doc_bullet(calculation_name, level=4))
                 else:
-                    parts.append(self._rtf_bullet("Nenhum campo calculado associado.", level=4))
+                    parts.append(self._doc_bullet("Nenhum campo calculado associado.", level=4))
 
-                parts.append(self._rtf_paragraph("Filtros", style="body_bold", level=3))
+                parts.append(self._doc_paragraph("Filtros", style="body_bold", level=3))
                 worksheet_filters = worksheet.get("filters", []) if worksheet else []
                 if worksheet_filters:
                     for filter_item in worksheet_filters:
                         field_label = filter_item.get("field_label") or filter_item.get("column") or "(sem nome)"
                         parts.append(
-                            self._rtf_bullet(
+                            self._doc_bullet(
                                 f"{field_label} | tipo: {filter_item.get('class') or '-'} | contexto: {'sim' if filter_item.get('is_context') else 'não'}",
                                 level=4,
                             )
                         )
                         if SHOW_FILTER_GROUP_VALUES_IN_RTF and filter_item.get("groupfilters"):
                             parts.append(
-                                self._rtf_bullet(
+                                self._doc_bullet(
                                     f"Valores/grupos: {compact_json(filter_item.get('groupfilters'))}",
                                     level=5,
                                 )
                             )
                 else:
-                    parts.append(self._rtf_bullet("Nenhum filtro identificado.", level=4))
+                    parts.append(self._doc_bullet("Nenhum filtro identificado.", level=4))
 
-                parts.append(self._rtf_paragraph("Parâmetros", style="body_bold", level=3))
+                parts.append(self._doc_paragraph("Parâmetros", style="body_bold", level=3))
                 if parameters_used:
                     for parameter_name in parameters_used:
-                        parts.append(self._rtf_bullet(parameter_name, level=4))
+                        parts.append(self._doc_bullet(parameter_name, level=4))
                 else:
-                    parts.append(self._rtf_bullet("Nenhum parâmetro associado.", level=4))
+                    parts.append(self._doc_bullet("Nenhum parâmetro associado.", level=4))
 
-            parts.append(self._rtf_paragraph("Filtros expostos no painel", style="body_bold", level=1))
+            parts.append(self._doc_paragraph("Filtros expostos no painel", style="body_bold", level=1))
             exposed_filters = dashboard.get("filters_exposed") or []
             if exposed_filters:
                 for filter_item in exposed_filters:
                     field_label = filter_item.get("field_label") or filter_item.get("param") or "(sem nome)"
                     parts.append(
-                        self._rtf_bullet(
+                        self._doc_bullet(
                             f"{field_label} | modo: {filter_item.get('mode') or '-'} | valores: {filter_item.get('values') or '-'}",
                             level=2,
                         )
                     )
             else:
-                parts.append(self._rtf_bullet("Nenhum filtro exposto identificado.", level=2))
+                parts.append(self._doc_bullet("Nenhum filtro exposto identificado.", level=2))
 
-            parts.append(self._rtf_paragraph("Zonas de layout", style="body_bold", level=1))
+            parts.append(self._doc_paragraph("Zonas de layout", style="body_bold", level=1))
             if dashboard.get("zones"):
                 for zone in dashboard["zones"]:
                     zone_summary = (
                         f"id={zone.get('id')} | nome={zone.get('name') or '-'} | tipo={zone.get('type_v2') or '-'} "
                         f"| x={zone.get('x') or '-'} | y={zone.get('y') or '-'} | w={zone.get('w') or '-'} | h={zone.get('h') or '-'}"
                     )
-                    parts.append(self._rtf_bullet(zone_summary, level=2))
+                    parts.append(self._doc_bullet(zone_summary, level=2))
             else:
-                parts.append(self._rtf_bullet("Nenhuma zona identificada.", level=2))
+                parts.append(self._doc_bullet("Nenhuma zona identificada.", level=2))
 
-            parts.append(self._rtf_paragraph("Layout de devices", style="body_bold", level=1))
+            parts.append(self._doc_paragraph("Layout de devices", style="body_bold", level=1))
             if dashboard.get("device_layouts"):
                 for layout in dashboard["device_layouts"]:
                     parts.append(
-                        self._rtf_bullet(
+                        self._doc_bullet(
                             f"{layout.get('name') or '(sem nome)'} | auto generated: {layout.get('auto_generated') or '-'} | zonas: {len(layout.get('zones', []))}",
                             level=2,
                         )
                     )
             else:
-                parts.append(self._rtf_bullet("Nenhum layout de device identificado.", level=2))
+                parts.append(self._doc_bullet("Nenhum layout de device identificado.", level=2))
 
-            parts.append(self._rtf_paragraph("Cores usadas", style="body_bold", level=1))
+            parts.append(self._doc_paragraph("Cores usadas", style="body_bold", level=1))
             colors_used = sorted(set(dashboard.get("colors_used", [])), key=str.lower)
             if colors_used:
                 for color in colors_used:
-                    parts.append(self._rtf_bullet(color, level=2))
+                    parts.append(self._doc_bullet(color, level=2))
             else:
-                parts.append(self._rtf_bullet("Nenhuma cor identificada.", level=2))
+                parts.append(self._doc_bullet("Nenhuma cor identificada.", level=2))
 
-            parts.append(self._rtf_paragraph("Fontes usadas", style="body_bold", level=1))
+            parts.append(self._doc_paragraph("Fontes usadas", style="body_bold", level=1))
             fonts_used = self._display_fonts(dashboard.get("fonts_used", []))
             for font in fonts_used:
-                parts.append(self._rtf_bullet(font, level=2))
+                parts.append(self._doc_bullet(font, level=2))
 
-        parts.append(self._rtf_paragraph("Seção Visual", style="section"))
-        parts.append(self._rtf_paragraph("Tokens Visuais", style="subsection"))
+        parts.append(self._doc_paragraph("Seção Visual", style="section"))
+        parts.append(self._doc_paragraph("Tokens Visuais", style="subsection"))
 
-        parts.append(self._rtf_paragraph("Cores", style="body_bold", level=1))
+        parts.append(self._doc_paragraph("Cores", style="body_bold", level=1))
         visual_colors = sorted(
             {item["value"] for item in self.metadata["visual_tokens"]["colors"] if item.get("value")},
             key=str.lower,
         )
         if visual_colors:
             for color in visual_colors:
-                parts.append(self._rtf_bullet(color, level=2))
+                parts.append(self._doc_bullet(color, level=2))
         else:
-            parts.append(self._rtf_bullet("Nenhuma cor identificada.", level=2))
+            parts.append(self._doc_bullet("Nenhuma cor identificada.", level=2))
 
-        parts.append(self._rtf_paragraph("Paletas de Cor", style="body_bold", level=1))
+        parts.append(self._doc_paragraph("Paletas de Cor", style="body_bold", level=1))
         palettes = self.metadata["preferences"]["color_palettes"]
         if palettes:
             for palette in palettes:
                 palette_name = palette.get("name") or "(sem nome)"
                 parts.append(
-                    self._rtf_bullet(
+                    self._doc_bullet(
                         f"{palette_name} | tipo: {palette.get('type') or '-'} | custom: {palette.get('custom') or '-'}",
                         level=2,
                     )
                 )
                 for color in palette.get("colors", []):
-                    parts.append(self._rtf_bullet(color, level=3, mono=self._looks_like_hex_color(color)))
+                    parts.append(self._doc_bullet(color, level=3, mono=self._looks_like_hex_color(color)))
         else:
-                parts.append(self._rtf_bullet("Nenhuma paleta de cor identificada.", level=2))
+            parts.append(self._doc_bullet("Nenhuma paleta de cor identificada.", level=2))
 
-        parts.append(self._rtf_paragraph("Fontes", style="body_bold", level=1))
+        parts.append(self._doc_paragraph("Fontes", style="body_bold", level=1))
         visual_fonts = self._display_fonts(
             [item["value"] for item in self.metadata["visual_tokens"]["fonts"] if item.get("value")]
         )
         for font in visual_fonts:
-            parts.append(self._rtf_bullet(font, level=2))
+            parts.append(self._doc_bullet(font, level=2))
 
-        parts.append(self._rtf_paragraph("Preferências e Paletas", style="body_bold", level=1))
+        parts.append(self._doc_paragraph("Preferências e Paletas", style="body_bold", level=1))
         preferences = self.metadata["preferences"]["preferences"]
         if preferences:
             for pref in preferences:
-                parts.append(self._rtf_bullet(f"{pref.get('name')}: {pref.get('value')}", level=2))
+                parts.append(self._doc_bullet(f"{pref.get('name')}: {pref.get('value')}", level=2))
         else:
-            parts.append(self._rtf_bullet("Nenhuma preferência global identificada.", level=2))
+            parts.append(self._doc_bullet("Nenhuma preferência global identificada.", level=2))
         if palettes:
             for palette in palettes:
                 parts.append(
-                    self._rtf_bullet(
+                    self._doc_bullet(
                         f"Paleta {palette.get('name') or '(sem nome)'} com {len(palette.get('colors', []))} cores",
                         level=2,
                     )
                 )
 
-        parts.append(self._rtf_paragraph("Seção Parâmetros", style="section"))
-        parts.append(self._rtf_paragraph("Parâmetros", style="subsection"))
+        parts.append(self._doc_paragraph("Seção Parâmetros", style="section"))
+        parts.append(self._doc_paragraph("Parâmetros", style="subsection"))
         parameters = self.metadata["parameters"]
         if not parameters:
-            parts.append(self._rtf_bullet("Nenhum parâmetro encontrado."))
+            parts.append(self._doc_bullet("Nenhum parâmetro encontrado."))
         for parameter in parameters:
             name = parameter.get("caption") or clean_brackets(parameter.get("name")) or "(sem nome)"
-            parts.append(self._rtf_paragraph(name, style="subsubsection"))
-            parts.append(self._rtf_bullet(f"Nome interno: {parameter.get('name')}", level=1))
-            parts.append(self._rtf_bullet(f"Datatype: {parameter.get('datatype')}", level=1))
-            parts.append(self._rtf_bullet(f"Type: {parameter.get('type')}", level=1))
-            parts.append(self._rtf_bullet(f"Role: {parameter.get('role')}", level=1))
-            parts.append(self._rtf_bullet(f"Domínio: {parameter.get('param_domain_type')}", level=1))
-            parts.append(self._rtf_bullet(f"Valor atual/default: {parameter.get('value')}", level=1))
+            parts.append(self._doc_paragraph(name, style="subsubsection"))
+            parts.append(self._doc_bullet(f"Nome interno: {parameter.get('name')}", level=1))
+            parts.append(self._doc_bullet(f"Datatype: {parameter.get('datatype')}", level=1))
+            parts.append(self._doc_bullet(f"Type: {parameter.get('type')}", level=1))
+            parts.append(self._doc_bullet(f"Role: {parameter.get('role')}", level=1))
+            parts.append(self._doc_bullet(f"Domínio: {parameter.get('param_domain_type')}", level=1))
+            parts.append(self._doc_bullet(f"Valor atual/default: {parameter.get('value')}", level=1))
             parts.extend(
-                self._rtf_list_block(
+                self._doc_list_block(
                     "Membros",
                     parameter.get("members", []),
                     level=1,
@@ -2496,13 +2563,13 @@ class TableauDoc:
             )
             source_field = parameter.get("source_field_details")
             if source_field:
-                parts.append(self._rtf_bullet(f"Preenchido por campo da fonte: {compact_json(source_field)}", level=1))
+                parts.append(self._doc_bullet(f"Preenchido por campo da fonte: {compact_json(source_field)}", level=1))
             else:
-                parts.append(self._rtf_bullet("Preenchido por campo da fonte: não", level=1))
+                parts.append(self._doc_bullet("Preenchido por campo da fonte: não", level=1))
             used_dashboards = sorted(parameter.get("used_in_dashboards", []), key=str.lower)
             used_worksheets = sorted(parameter.get("used_in_worksheets", []), key=str.lower)
             parts.extend(
-                self._rtf_list_block(
+                self._doc_list_block(
                     "Usado nos dashboards",
                     used_dashboards,
                     level=1,
@@ -2510,7 +2577,7 @@ class TableauDoc:
                 )
             )
             parts.extend(
-                self._rtf_list_block(
+                self._doc_list_block(
                     "Usado nas planilhas",
                     used_worksheets,
                     level=1,
@@ -2518,30 +2585,30 @@ class TableauDoc:
                 )
             )
 
-        parts.append(self._rtf_paragraph("Relação de Campos Calculados", style="section"))
-        parts.append(self._rtf_paragraph("Relação de Campos Calculados", style="subsection"))
+        parts.append(self._doc_paragraph("Relação de Campos Calculados", style="section"))
+        parts.append(self._doc_paragraph("Relação de Campos Calculados", style="subsection"))
         calculations = self.metadata["calculations"]
         if not calculations:
-            parts.append(self._rtf_bullet("Nenhum campo calculado encontrado."))
+            parts.append(self._doc_bullet("Nenhum campo calculado encontrado."))
         grouped_calculations: dict[str, list[dict[str, Any]]] = {}
         for calculation in calculations:
             grouped_calculations.setdefault(calculation.get("datasource") or "(sem datasource)", []).append(calculation)
         for datasource_name, items in grouped_calculations.items():
-            parts.append(self._rtf_paragraph(datasource_name, style="subsubsection"))
+            parts.append(self._doc_paragraph(datasource_name, style="subsubsection"))
             for item in items:
                 caption = self._display_object_name(item)
-                parts.append(self._rtf_paragraph(caption, style="body_bold", level=1))
-                parts.append(self._rtf_bullet(f"Nome interno: {item.get('name')}", level=2))
-                parts.append(self._rtf_bullet(f"Origem: {item.get('origin')}", level=2))
-                parts.append(self._rtf_bullet(f"Role: {item.get('role') or '-'}", level=2))
-                parts.append(self._rtf_bullet(f"Datatype: {item.get('datatype') or '-'}", level=2))
-                parts.append(self._rtf_bullet(f"Type: {item.get('type') or '-'}", level=2))
-                parts.append(self._rtf_bullet(f"Em uso: {format_yes_no(item.get('is_used'))}", level=2))
-                parts.append(self._rtf_bullet(f"Oculto: {format_yes_no(item.get('hidden'))}", level=2))
+                parts.append(self._doc_paragraph(caption, style="body_bold", level=1))
+                parts.append(self._doc_bullet(f"Nome interno: {item.get('name')}", level=2))
+                parts.append(self._doc_bullet(f"Origem: {item.get('origin')}", level=2))
+                parts.append(self._doc_bullet(f"Role: {item.get('role') or '-'}", level=2))
+                parts.append(self._doc_bullet(f"Datatype: {item.get('datatype') or '-'}", level=2))
+                parts.append(self._doc_bullet(f"Type: {item.get('type') or '-'}", level=2))
+                parts.append(self._doc_bullet(f"Em uso: {format_yes_no(item.get('is_used'))}", level=2))
+                parts.append(self._doc_bullet(f"Oculto: {format_yes_no(item.get('hidden'))}", level=2))
                 alias_rows = self._format_aliases(item.get("aliases", []))
                 if alias_rows:
                     parts.extend(
-                        self._rtf_list_block(
+                        self._doc_list_block(
                             "Aliases",
                             alias_rows,
                             level=2,
@@ -2551,7 +2618,7 @@ class TableauDoc:
                 impacts = sorted(item.get("impacts", []), key=str.lower)
                 if impacts:
                     parts.extend(
-                        self._rtf_list_block(
+                        self._doc_list_block(
                             "Impacta / é referenciado por",
                             impacts,
                             level=2,
@@ -2562,7 +2629,7 @@ class TableauDoc:
                 used_in_worksheets = sorted(item.get("used_in_worksheets", []), key=str.lower)
                 if used_in_dashboards:
                     parts.extend(
-                        self._rtf_list_block(
+                        self._doc_list_block(
                             "Usado nos dashboards",
                             used_in_dashboards,
                             level=2,
@@ -2571,52 +2638,373 @@ class TableauDoc:
                     )
                 if used_in_worksheets:
                     parts.extend(
-                        self._rtf_list_block(
+                        self._doc_list_block(
                             "Usado nas planilhas",
                             used_in_worksheets,
                             level=2,
                             empty_text="não identificado",
                         )
                     )
-                parts.append(self._rtf_bullet("Código:", level=2))
-                parts.append(self._rtf_code_block(item.get("codigo") or "-", level=3))
+                parts.append(self._doc_bullet("Código:", level=2))
+                parts.append(self._doc_code_block(item.get("codigo") or "-", level=3))
 
         unused_objects = self._collect_unused_objects()
-        parts.append(self._rtf_paragraph("Objetos não usados", style="section"))
-        parts.append(self._rtf_paragraph("Objetos não usados", style="subsection"))
+        parts.append(self._doc_paragraph("Objetos não usados", style="section"))
+        parts.append(self._doc_paragraph("Objetos não usados", style="subsection"))
 
-        parts.append(self._rtf_paragraph("Campos calculados", style="body_bold", level=1))
+        parts.append(self._doc_paragraph("Campos calculados", style="body_bold", level=1))
         if unused_objects["calculations"]:
             for item in unused_objects["calculations"]:
                 caption = self._display_object_name(item)
-                parts.append(self._rtf_bullet(caption, level=2))
-                parts.append(self._rtf_bullet(f"Oculto: {format_yes_no(item.get('hidden'))}", level=3))
+                parts.append(self._doc_bullet(caption, level=2))
+                parts.append(self._doc_bullet(f"Oculto: {format_yes_no(item.get('hidden'))}", level=3))
         else:
-            parts.append(self._rtf_bullet("Nenhum campo calculado não usado identificado.", level=2))
+            parts.append(self._doc_bullet("Nenhum campo calculado não usado identificado.", level=2))
 
-        parts.append(self._rtf_paragraph("Parâmetros", style="body_bold", level=1))
+        parts.append(self._doc_paragraph("Parâmetros", style="body_bold", level=1))
         if unused_objects["parameters"]:
             for item in unused_objects["parameters"]:
                 caption = self._display_object_name(item)
-                parts.append(self._rtf_bullet(caption, level=2))
+                parts.append(self._doc_bullet(caption, level=2))
         else:
-            parts.append(self._rtf_bullet("Nenhum parâmetro não usado identificado.", level=2))
+            parts.append(self._doc_bullet("Nenhum parâmetro não usado identificado.", level=2))
 
-        parts.append(self._rtf_paragraph("Fontes de dados", style="body_bold", level=1))
+        parts.append(self._doc_paragraph("Fontes de dados", style="body_bold", level=1))
         if unused_objects["datasources"]:
             for item in unused_objects["datasources"]:
                 caption = self._display_object_name(item, allow_clean_brackets=False)
-                parts.append(self._rtf_bullet(caption, level=2))
+                parts.append(self._doc_bullet(caption, level=2))
         else:
-            parts.append(self._rtf_bullet("Nenhuma fonte de dados não usada identificada.", level=2))
+            parts.append(self._doc_bullet("Nenhuma fonte de dados não usada identificada.", level=2))
 
-        return "".join(parts)
+        return parts
+
+    def _doc_paragraph(self, text: str, style: str = "body", level: int = 0, mono: bool = False) -> dict[str, Any]:
+        return {"type": "paragraph", "text": text, "style": style, "level": level, "mono": mono}
+
+    def _doc_bullet(self, text: str, level: int = 0, mono: bool = False) -> dict[str, Any]:
+        return {"type": "bullet", "text": text, "level": level, "mono": mono}
+
+    def _doc_code_block(self, text: str, level: int = 0) -> dict[str, Any]:
+        return {"type": "code", "text": text, "level": level, "mono": True}
+
+    def _doc_list_block(
+        self,
+        label: str,
+        values: list[Any],
+        level: int = 0,
+        empty_text: str = "-",
+        mono: bool = False,
+    ) -> list[dict[str, Any]]:
+        parts = [self._doc_bullet(f"{label}:", level=level)]
+        if values:
+            for value in values:
+                parts.append(self._doc_bullet(str(value), level=level + 1, mono=mono))
+        else:
+            parts.append(self._doc_bullet(empty_text, level=level + 1, mono=mono))
+        return parts
+
+    def _render_rtf_block(self, block: dict[str, Any]) -> str:
+        if block["type"] == "paragraph":
+            return self._rtf_paragraph(
+                block["text"],
+                style=block.get("style", "body"),
+                level=block.get("level", 0),
+                mono=block.get("mono", False),
+            )
+        if block["type"] == "bullet":
+            return self._rtf_bullet(
+                block["text"],
+                level=block.get("level", 0),
+                mono=block.get("mono", False),
+            )
+        return self._rtf_code_block(block["text"], level=block.get("level", 0))
+
+    def _configure_docx_document(self, document: Document) -> None:
+        normal_style = document.styles["Normal"]
+        self._set_docx_font_family(normal_style.font, DOCX_BODY_FONT_NAME)
+        normal_style.font.size = Pt(10)
+        normal_paragraph_format = normal_style.paragraph_format
+        normal_paragraph_format.line_spacing = 1.0
+        normal_paragraph_format.space_before = Pt(0)
+        normal_paragraph_format.space_after = Pt(6)
+        document.core_properties.title = f"Documentação do Workbook Tableau - {self.source_path.name}"
+        self._configure_docx_header(document)
+        self._configure_docx_footer(document)
+
+    def _append_docx_block(self, document: Document, block: dict[str, Any]) -> None:
+        block_type = block["type"]
+        if block_type == "bullet":
+            paragraph = document.add_paragraph()
+            self._apply_docx_paragraph_format(paragraph)
+            level = block.get("level", 0)
+            paragraph.paragraph_format.left_indent = Pt(18 * max(level, 0))
+            paragraph.paragraph_format.first_line_indent = Pt(-12)
+            run = paragraph.add_run(f"• {block['text']}")
+            self._apply_docx_run_style(
+                run,
+                mono=block.get("mono", False),
+                bold=False,
+                italic=False,
+                font_size=10,
+            )
+            return
+        if block_type == "code":
+            paragraph = document.add_paragraph()
+            self._apply_docx_paragraph_format(paragraph)
+            paragraph.paragraph_format.left_indent = Pt(18 * max(block.get("level", 0), 0))
+            run = paragraph.add_run(block["text"])
+            self._apply_docx_run_style(run, mono=True, bold=False, italic=False, font_size=10)
+            return
+
+        paragraph = document.add_paragraph()
+        self._apply_docx_paragraph_format(paragraph)
+        style = block.get("style", "body")
+        level = block.get("level", 0)
+        heading_style = self._docx_heading_style_for_block(style)
+        if heading_style:
+            paragraph.style = heading_style
+        paragraph.paragraph_format.left_indent = Pt(18 * max(level, 0))
+        font_size = 10
+        bold = False
+        italic = False
+        if style == "title":
+            font_size = 16
+            bold = True
+        elif style == "subtitle":
+            font_size = 10
+            italic = True
+        elif style == "section":
+            font_size = 14
+            bold = True
+            paragraph.paragraph_format.left_indent = Cm(-0.8)
+            paragraph.paragraph_format.space_before = Pt(12)
+        elif style == "subsection":
+            font_size = 12
+            bold = True
+            paragraph.paragraph_format.left_indent = Cm(-0.7)
+            paragraph.paragraph_format.space_before = Pt(12)
+        elif style == "subsubsection":
+            font_size = 11
+            bold = True
+            paragraph.paragraph_format.space_before = Pt(12)
+        elif style == "body_bold":
+            font_size = 10.5
+            bold = True
+        run = paragraph.add_run(block["text"])
+        self._apply_docx_run_style(
+            run,
+            mono=block.get("mono", False),
+            bold=bold,
+            italic=italic,
+            font_size=font_size,
+        )
+
+    def _apply_docx_run_style(
+        self,
+        run: Any,
+        mono: bool,
+        bold: bool,
+        italic: bool,
+        font_size: float,
+    ) -> None:
+        run.bold = bold
+        run.italic = italic
+        self._set_docx_font_family(
+            run.font,
+            DOCX_MONO_FONT_NAME if mono else DOCX_BODY_FONT_NAME,
+        )
+        run.font.size = Pt(font_size)
+
+    def _set_docx_font_family(self, font: Any, font_name: str) -> None:
+        """
+        Define a fonte em todos os slots relevantes do DOCX.
+
+        Apenas `font.name` pode não ser suficiente para o Word, que em alguns
+        cenários mantém Calibri se `w:rFonts` não estiver totalmente preenchido.
+        """
+        font.name = font_name
+        if getattr(font, "element", None) is None:
+            return
+        r_pr = font.element.get_or_add_rPr()
+        r_fonts = r_pr.get_or_add_rFonts()
+        for attr in ("w:ascii", "w:hAnsi", "w:eastAsia", "w:cs"):
+            r_fonts.set(qn(attr), font_name)
+
+    def _apply_docx_paragraph_format(self, paragraph: Any) -> None:
+        """Aplica o padrão de espaçamento solicitado para os parágrafos do Word."""
+        paragraph_format = paragraph.paragraph_format
+        paragraph_format.line_spacing = 1.0
+        paragraph_format.space_before = Pt(0)
+        paragraph_format.space_after = Pt(6)
+
+    def _configure_docx_footer(self, document: Document) -> None:
+        """Configura o rodapé com nome da pasta de trabalho e paginação dinâmica."""
+        workbook_name = self.base_name
+        for section in document.sections:
+            footer = section.footer
+            paragraph = footer.paragraphs[0] if footer.paragraphs else footer.add_paragraph()
+            paragraph.clear()
+            self._apply_docx_paragraph_format(paragraph)
+
+            usable_width = section.page_width - section.left_margin - section.right_margin
+            paragraph.paragraph_format.tab_stops.add_tab_stop(
+                usable_width,
+                alignment=WD_TAB_ALIGNMENT.RIGHT,
+            )
+            self._apply_docx_top_border(paragraph)
+
+            left_run = paragraph.add_run(f"Documentação Tableau pasta de Trabalho {workbook_name}")
+            self._apply_docx_run_style(left_run, mono=False, bold=False, italic=False, font_size=8)
+
+            tab_run = paragraph.add_run("\t")
+            self._apply_docx_run_style(tab_run, mono=False, bold=False, italic=False, font_size=8)
+
+            self._append_docx_field(paragraph, "PAGE", font_size=8)
+
+            middle_run = paragraph.add_run(" de ")
+            self._apply_docx_run_style(middle_run, mono=False, bold=False, italic=False, font_size=8)
+
+            self._append_docx_field(paragraph, "NUMPAGES", font_size=8)
+
+    def _configure_docx_header(self, document: Document) -> None:
+        """Configura o cabeçalho com título centralizado e linha inferior."""
+        for section in document.sections:
+            header = section.header
+            paragraph = header.paragraphs[0] if header.paragraphs else header.add_paragraph()
+            paragraph.clear()
+            self._apply_docx_paragraph_format(paragraph)
+            paragraph.alignment = 1
+            self._apply_docx_bottom_border(paragraph)
+
+            run = paragraph.add_run("Documentação Tableau")
+            self._apply_docx_run_style(run, mono=False, bold=False, italic=False, font_size=8)
+
+    def _apply_docx_top_border(self, paragraph: Any) -> None:
+        """Adiciona uma linha superior ao parágrafo, útil para o rodapé."""
+        p_pr = paragraph._p.get_or_add_pPr()
+        p_bdr = p_pr.find(qn("w:pBdr"))
+        if p_bdr is None:
+            p_bdr = OxmlElement("w:pBdr")
+            p_pr.append(p_bdr)
+        top = p_bdr.find(qn("w:top"))
+        if top is None:
+            top = OxmlElement("w:top")
+            p_bdr.append(top)
+        top.set(qn("w:val"), "single")
+        top.set(qn("w:sz"), "6")
+        top.set(qn("w:space"), "1")
+        top.set(qn("w:color"), "BFBFBF")
+
+    def _apply_docx_bottom_border(self, paragraph: Any) -> None:
+        """Adiciona uma linha inferior ao parágrafo, útil para o cabeçalho."""
+        p_pr = paragraph._p.get_or_add_pPr()
+        p_bdr = p_pr.find(qn("w:pBdr"))
+        if p_bdr is None:
+            p_bdr = OxmlElement("w:pBdr")
+            p_pr.append(p_bdr)
+        bottom = p_bdr.find(qn("w:bottom"))
+        if bottom is None:
+            bottom = OxmlElement("w:bottom")
+            p_bdr.append(bottom)
+        bottom.set(qn("w:val"), "single")
+        bottom.set(qn("w:sz"), "6")
+        bottom.set(qn("w:space"), "1")
+        bottom.set(qn("w:color"), "BFBFBF")
+
+    def _append_docx_field(self, paragraph: Any, field_name: str, font_size: float) -> None:
+        """Insere um campo dinâmico do Word, como PAGE ou NUMPAGES."""
+        run = paragraph.add_run()
+        self._apply_docx_run_style(run, mono=False, bold=False, italic=False, font_size=font_size)
+
+        begin = OxmlElement("w:fldChar")
+        begin.set(qn("w:fldCharType"), "begin")
+
+        instr = OxmlElement("w:instrText")
+        instr.set(qn("xml:space"), "preserve")
+        instr.text = field_name
+
+        separate = OxmlElement("w:fldChar")
+        separate.set(qn("w:fldCharType"), "separate")
+
+        placeholder = OxmlElement("w:t")
+        placeholder.text = "1"
+
+        end = OxmlElement("w:fldChar")
+        end.set(qn("w:fldCharType"), "end")
+
+        run._r.append(begin)
+        run._r.append(instr)
+        run._r.append(separate)
+        run._r.append(placeholder)
+        run._r.append(end)
+
+    def _append_docx_toc(self, document: Document) -> None:
+        """Insere um índice automático com os três níveis principais."""
+        toc_title = document.add_paragraph()
+        self._apply_docx_paragraph_format(toc_title)
+        title_run = toc_title.add_run("Índice")
+        self._apply_docx_run_style(title_run, mono=False, bold=True, italic=False, font_size=12)
+
+        toc_paragraph = document.add_paragraph()
+        self._apply_docx_paragraph_format(toc_paragraph)
+        self._append_docx_complex_field(
+            toc_paragraph,
+            'TOC \\o "1-3" \\h \\z \\u',
+            placeholder_text="Atualize o índice no Word se necessário.",
+            font_size=10,
+        )
+
+    def _append_docx_complex_field(
+        self,
+        paragraph: Any,
+        instruction: str,
+        placeholder_text: str,
+        font_size: float,
+    ) -> None:
+        """Insere um campo complexo do Word, como o TOC."""
+        run = paragraph.add_run()
+        self._apply_docx_run_style(run, mono=False, bold=False, italic=False, font_size=font_size)
+
+        begin = OxmlElement("w:fldChar")
+        begin.set(qn("w:fldCharType"), "begin")
+
+        instr = OxmlElement("w:instrText")
+        instr.set(qn("xml:space"), "preserve")
+        instr.text = instruction
+
+        separate = OxmlElement("w:fldChar")
+        separate.set(qn("w:fldCharType"), "separate")
+
+        placeholder = OxmlElement("w:t")
+        placeholder.text = placeholder_text
+
+        end = OxmlElement("w:fldChar")
+        end.set(qn("w:fldCharType"), "end")
+
+        run._r.append(begin)
+        run._r.append(instr)
+        run._r.append(separate)
+        run._r.append(placeholder)
+        run._r.append(end)
+
+    def _docx_heading_style_for_block(self, style: str) -> str | None:
+        """Mapeia os níveis principais do relatório para estilos reconhecidos pelo Word."""
+        if style == "section":
+            return "Heading 1"
+        if style == "subsection":
+            return "Heading 2"
+        if style == "subsubsection":
+            return "Heading 3"
+        return None
 
     def _rtf_paragraph(self, text: str, style: str = "body", level: int = 0, mono: bool = False) -> str:
         escaped = self._rtf_escape(text)
         indent = 360 * max(level, 0)
         if style == "title":
             return rf"\pard\sa240\sb160\f0\fs32\b {escaped}\b0\par"
+        if style == "subtitle":
+            return rf"\pard\sa120\sb160\i\f0\fs20 {escaped}\i0\par"
         if style == "section":
             return rf"\pard\sa200\sb120\li{indent}\f0\fs28\b {escaped}\b0\par"
         if style == "subsection":
@@ -3156,9 +3544,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--format",
         dest="output_format",
-        choices=["all", "markdown", "json", "excel", "rtf"],
+        choices=["all", "markdown", "json", "excel", "rtf", "docx"],
         default="all",
-        help="Formato principal da documentação a gerar. Em `markdown`, o script gera `.md` e `.rtf`. O mapa XPath/JSON é sempre gerado.",
+        help="Formato principal da documentação a gerar. Em `markdown`, o script gera `.md` e `.rtf`. O mapa XPath/JSON é sempre gerado; em `docx`, o relatório Word é exportado diretamente.",
     )
     return parser.parse_args()
 
@@ -3184,7 +3572,7 @@ def main() -> None:
         print(f"Erro: {exc}")
         print(
             "Uso: python Tableau_doc.py <caminho_do_arquivo.twb|.twbx> "
-            "[--format all|markdown|json|excel|rtf]"
+            "[--format all|markdown|json|excel|rtf|docx]"
         )
         sys.exit(1)
 

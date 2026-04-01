@@ -8,7 +8,7 @@ Ferramenta em Python para documentar workbooks Tableau ` .twb` e ` .twbx` sem ab
 - [src/tableau_doc.py](/Users/sandromollica/Library/CloudStorage/OneDrive-Pessoal/Workspaces/Antigravity/TableauDoc/src/tableau_doc.py): implementação principal
 - [requirements.txt](/Users/sandromollica/Library/CloudStorage/OneDrive-Pessoal/Workspaces/Antigravity/TableauDoc/requirements.txt): dependências Python
 - [docs/SCRIPT_DOCUMENTATION.md](/Users/sandromollica/Library/CloudStorage/OneDrive-Pessoal/Workspaces/Antigravity/TableauDoc/docs/SCRIPT_DOCUMENTATION.md): documentação funcional e técnica do script
-- [docs/DEVELOPMENT_REQUIREMENTS.md](/Users/sandromollica/Library/CloudStorage/OneDrive-Pessoal/Workspaces/Antigravity/TableauDoc/docs/DEVELOPMENT_REQUIREMENTS.md): requisitos usados no desenvolvimento
+- [docs/ROUTINE_REFERENCE.md](/Users/sandromollica/Library/CloudStorage/OneDrive-Pessoal/Workspaces/Antigravity/TableauDoc/docs/ROUTINE_REFERENCE.md): referência detalhada das rotinas e responsabilidades internas
 
 ## Instalação
 
@@ -26,6 +26,7 @@ python3 Tableau_doc.py /caminho/arquivo.twbx --format markdown
 python3 Tableau_doc.py /caminho/arquivo.twbx --format json
 python3 Tableau_doc.py /caminho/arquivo.twbx --format excel
 python3 Tableau_doc.py /caminho/arquivo.twbx --format rtf
+python3 Tableau_doc.py /caminho/arquivo.twbx --format docx
 ```
 
 ## Leitura opcional de `.tdsx` externo
@@ -90,8 +91,8 @@ TableauDoc/
 │  ├─ __init__.py
 │  └─ tableau_doc.py
 ├─ docs/
-│  ├─ SCRIPT_DOCUMENTATION.md
-│  └─ DEVELOPMENT_REQUIREMENTS.md
+│  ├─ ROUTINE_REFERENCE.md
+│  └─ SCRIPT_DOCUMENTATION.md
 ├─ data/
 ├─ TableauDoc.code-workspace
 ├─ Tableau_doc.py
@@ -106,7 +107,8 @@ TableauDoc/
 - `--format json`: gera `xml`, `mapa_XPath_JSON.*` e `json`
 - `--format excel`: gera `xml`, `mapa_XPath_JSON.*` e `xlsx`
 - `--format rtf`: gera `xml`, `mapa_XPath_JSON.*` e `rtf`
-- `--format all`: gera todos os formatos
+- `--format docx`: gera `xml`, `mapa_XPath_JSON.*` e `docx`
+- `--format all`: gera `xml`, `mapa_XPath_JSON.*`, `json`, `md`, `rtf`, `docx`, `xlsx` e o manifesto
 
 ## O que o script documenta
 
@@ -127,11 +129,20 @@ TableauDoc/
 
 ## Destaques do relatório
 
-- o arquivo `.rtf` usa `Calibre` como fonte principal e uma fonte monoespaçada padrão do sistema para trechos de código e valores hexadecimais
+- o arquivo `.rtf` usa `Arial` como fonte principal e uma fonte monoespaçada padrão do sistema para trechos de código e valores hexadecimais
+- o arquivo `.docx` reaproveita a mesma estrutura lógica do relatório `.rtf`, com hierarquia equivalente de títulos, bullets e blocos de código
+- o arquivo `.docx` é gerado diretamente com `python-docx`, sem depender de conversão externa a partir do `.md` ou do `.rtf`
+- o arquivo `.docx` usa as mesmas fontes configuráveis do `.rtf`: `Arial` para corpo e `Courier New` para blocos monoespaçados
 - o relatório mostra data e hora de geração logo abaixo do título
 - a seção `Relação de Campos Calculados` informa alias, uso, dependências, código e se o campo está oculto
 - a seção `Objetos não usados` lista campos calculados, parâmetros e fontes de dados sem uso efetivo
 - quando o XML não explicita a tipografia usada em um dashboard, o relatório mostra `Fonte padrão do Tableau (não explicitada no XML)`
+
+## Dependências principais
+
+- `pandas`: estruturação e exportação tabular para Excel
+- `openpyxl`: escrita do arquivo `.xlsx`
+- `python-docx`: geração do arquivo `.docx`
 
 ## Observações
 
