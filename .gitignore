@@ -33,6 +33,7 @@ htmlcov/
 Thumbs.db
 .vscode/
 .idea/
+*.code-workspace
 
 # Local configuration
 .env
