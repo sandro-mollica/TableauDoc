@@ -2868,17 +2868,40 @@ class TableauDoc:
             self._append_docx_field(paragraph, "NUMPAGES", font_size=8)
 
     def _configure_docx_header(self, document: Document) -> None:
-        """Configura o cabeçalho com título centralizado e linha inferior."""
+        """Configura o cabeçalho com título centralizado e linha inferior e logos se configurados."""
+        try:
+            config_data = load_config()
+            logo_empresa = config_data.get("logo_empresa")
+            logo_cliente = config_data.get("logo_cliente")
+        except Exception:
+            logo_empresa = None
+            logo_cliente = None
+
         for section in document.sections:
             header = section.header
             paragraph = header.paragraphs[0] if header.paragraphs else header.add_paragraph()
             paragraph.clear()
             self._apply_docx_paragraph_format(paragraph)
-            paragraph.alignment = 1
+            
+            paragraph.alignment = 0
+            usable_width = section.page_width - section.left_margin - section.right_margin
+            paragraph.paragraph_format.tab_stops.add_tab_stop(int(usable_width / 2), alignment=WD_TAB_ALIGNMENT.CENTER)
+            paragraph.paragraph_format.tab_stops.add_tab_stop(int(usable_width), alignment=WD_TAB_ALIGNMENT.RIGHT)
+            
             self._apply_docx_bottom_border(paragraph)
 
+            if logo_cliente and Path(logo_cliente).is_file():
+                run_cli = paragraph.add_run()
+                run_cli.add_picture(logo_cliente, height=Cm(0.91))
+            
+            paragraph.add_run("\t")
             run = paragraph.add_run("Documentação Tableau")
             self._apply_docx_run_style(run, mono=False, bold=False, italic=False, font_size=8)
+            
+            paragraph.add_run("\t")
+            if logo_empresa and Path(logo_empresa).is_file():
+                run_emp = paragraph.add_run()
+                run_emp.add_picture(logo_empresa, height=Cm(0.91))
 
     def _apply_docx_top_border(self, paragraph: Any) -> None:
         """Adiciona uma linha superior ao parágrafo, útil para o rodapé."""
