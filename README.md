@@ -117,7 +117,6 @@ TableauDoc/
 │  ├─ ROUTINE_REFERENCE.md
 │  └─ SCRIPT_DOCUMENTATION.md
 ├─ data/
-├─ TableauDoc.code-workspace
 ├─ main.py
 ├─ README.md
 ├─ requirements.txt
