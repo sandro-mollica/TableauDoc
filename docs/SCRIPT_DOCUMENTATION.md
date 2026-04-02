@@ -1,14 +1,14 @@
-# Documentação do Script `Tableau_doc.py`
+# Documentação do Script `main.py`
 
-Observação: o projeto também inclui o launcher [PowerBI_doc.py](/Users/sandromollica/Library/CloudStorage/OneDrive-Pessoal/Workspaces/Antigravity/TableauDoc/PowerBI_doc.py) e a implementação [src/powerbi_doc.py](/Users/sandromollica/Library/CloudStorage/OneDrive-Pessoal/Workspaces/Antigravity/TableauDoc/src/powerbi_doc.py) para relatórios Power BI ` .pbix`, mas essa opção ainda está em desenvolvimento.
+Observação: o projeto possui um único iniciador chamado `main.py` na raiz, e duas implementações internas, [tableaudoc/tableau_doc.py](../tableaudoc/tableau_doc.py) para arquivos `.twbx` e [tableaudoc/powerbi_doc.py](../tableaudoc/powerbi_doc.py) para relatórios Power BI ` .pbix`, (esta última em desenvolvimento).
 
 ## Objetivo
 
-O launcher `Tableau_doc.py` na raiz encaminha a execução para a implementação principal em `src/tableau_doc.py`, responsável por extrair e documentar metadados de arquivos Tableau ` .twb` e ` .twbx` sem depender do Tableau Desktop.
+O iniciador unificado `main.py` encaminha a execução para a implementação designada dependendo do parâmetro `T` ou `P`. A rotina `tableaudoc/tableau_doc.py` é responsável por extrair e documentar metadados de arquivos Tableau ` .twb` e ` .twbx` sem depender do Tableau Desktop.
 
 Ele transforma o workbook em artefatos legíveis para análise, auditoria e documentação técnica.
 
-Para uma descrição aprofundada de cada função e método, consulte [docs/ROUTINE_REFERENCE.md](/Users/sandromollica/Library/CloudStorage/OneDrive-Pessoal/Workspaces/Antigravity/TableauDoc/docs/ROUTINE_REFERENCE.md).
+Para uma descrição aprofundada de cada função e método, consulte [docs/ROUTINE_REFERENCE.md](ROUTINE_REFERENCE.md).
 
 ## Entradas suportadas
 
@@ -48,13 +48,13 @@ Observações sobre geração por formato:
 ## Parâmetros de execução
 
 ```bash
-python3 Tableau_doc.py /caminho/arquivo.twbx --format all
+python3 main.py T /caminho/arquivo.twbx --format all
 ```
 
 Fluxo alternativo em desenvolvimento para Power BI:
 
 ```bash
-python3 PowerBI_doc.py /caminho/arquivo.pbix --format all
+python3 main.py P /caminho/arquivo.pbix --format all
 ```
 
 ### Opções de `--format`
@@ -99,7 +99,18 @@ Exemplo com um único `.tdsx`:
 }
 ```
 
-Exemplo com múltiplos caminhos:
+- `lista`, para múltiplos `.tdsx` e/ou pastas
+
+Exemplo com um único `.tdsx`:
+
+```json
+{
+  "tableau_path": "/caminho/arquivo.twbx",
+  "external_tdsx_paths": "/caminho/fonte_publicada.tdsx"
+}
+```
+
+Exemplo com múltiplos caminhos e logotipos:
 
 ```json
 {
@@ -107,9 +118,17 @@ Exemplo com múltiplos caminhos:
   "external_tdsx_paths": [
     "/caminho/pasta_com_tdsx",
     "/caminho/fonte_publicada.tdsx"
-  ]
+  ],
+  "logo_empresa": "images/logo_empresa.png",
+  "logo_cliente": "images/logo_cliente.png"
 }
 ```
+
+Também é possível configurar logotipos para inserção em cabeçalhos de relatórios `.docx`:
+
+- `logo_empresa`: caminho para a imagem a ser inserida no canto esquerdo.
+- `logo_cliente`: caminho para a imagem a ser inserida no canto direito.
+
 
 Condição aplicada no código:
 
@@ -270,6 +289,7 @@ Configuração atual aplicada ao `.docx`:
 - fonte monoespaçada: `Courier New`
 - tamanho base do texto: `10 pt`
 - título do documento Word preenchido nas propriedades do arquivo
+- inserção de logotipos configuráveis no cabeçalho (empresa à esquerda, cliente à direita) redimensionados com 0.91 cm de altura constante.
 
 ## Limitações conhecidas
 

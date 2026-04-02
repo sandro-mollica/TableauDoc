@@ -1,8 +1,8 @@
-# Referência de Rotinas do `src/tableau_doc.py`
+# Referência de Rotinas do `tableaudoc/tableau_doc.py`
 
 ## Visão geral
 
-Este documento descreve, de forma sistemática, o papel de cada rotina presente em `src/tableau_doc.py`.
+Este documento descreve, de forma sistemática, o papel de cada rotina presente em `tableaudoc/tableau_doc.py`.
 
 O objetivo é oferecer uma leitura técnica orientada à manutenção. A proposta não é apenas listar nomes de funções, mas explicar como cada rotina participa do fluxo de carga do workbook, extração de metadados, enriquecimento semântico, geração de artefatos e integração com a linha de comando.
 
