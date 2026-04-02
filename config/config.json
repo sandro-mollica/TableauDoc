@@ -1,6 +1,6 @@
 {
-	"tableau_path": "pasta_exemplo/Indicadores Mundiais.twbx",
-	"powerbi_path": "",
+	"tableau_path": "workbooks/Indicadores_Mundiais.twbx",
+	"powerbi_path": "workbooks/Corporate_Spend.pbix",
 	"external_tdsx_paths": [
 		""
 	],
