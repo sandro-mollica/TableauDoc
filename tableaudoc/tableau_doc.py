@@ -184,38 +184,66 @@ def normalize_lookup_token(value: str | None) -> str | None:
     return text.strip("_") or None
 
 
-def element_path_with_indices(root: ET.Element, target: ET.Element) -> str:
+def element_path_with_indices(root: ET.Element, target: ET.Element, parent_map: dict | None = None) -> str:
     """
     Monta um caminho XPath simples e legível até um elemento.
-    O `xml.etree` não mantém ponteiro para o pai, então percorremos a árvore.
+    O `xml.etree` não mantém ponteiro para o pai, então percorremos a árvore ou usamos o parent_map para O(1) ascendency.
     """
-    target_id = id(target)
-
-    def walk(node: ET.Element, trail: list[str]) -> list[str] | None:
-        if id(node) == target_id:
-            return trail + [node.tag]
-
-        child_counts: Counter[str] = Counter()
-        for child in list(node):
-            child_counts[child.tag] += 1
-            siblings_same_tag = [item for item in list(node) if item.tag == child.tag]
-            if len(siblings_same_tag) > 1:
-                index = siblings_same_tag.index(child) + 1
-                child_name = f"{child.tag}[{index}]"
-            else:
-                child_name = child.tag
-
-            result = walk(child, trail + [node.tag, child_name])
-            if result is not None:
-                return result
-        return None
-
-    if id(root) == target_id:
+    if id(root) == id(target):
         return f"/{root.tag}"
 
-    result = walk(root, [])
-    if result is None:
-        return ""
+    if parent_map:
+        trail = []
+        current = target
+        while current is not root and current in parent_map:
+            parent = parent_map[current]
+            siblings = list(parent)
+            tag_counts: Counter[str] = Counter(c.tag for c in siblings)
+            
+            if tag_counts[current.tag] > 1:
+                current_indices = Counter()
+                for child in siblings:
+                    current_indices[child.tag] += 1
+                    if child is current:
+                        trail.append(f"{current.tag}[{current_indices[current.tag]}]")
+                        break
+            else:
+                trail.append(current.tag)
+            current = parent
+            
+        if current is not root:
+            return ""
+        
+        trail.append(root.tag)
+        trail.reverse()
+        result = trail
+    else:
+        target_id = id(target)
+        def walk(node: ET.Element, trail: list[str]) -> list[str] | None:
+            if id(node) == target_id:
+                return trail + [node.tag]
+
+            children = list(node)
+            tag_counts: Counter[str] = Counter(child.tag for child in children)
+            current_indices: Counter[str] = Counter()
+
+            for child in children:
+                tag = child.tag
+                current_indices[tag] += 1
+                
+                if tag_counts[tag] > 1:
+                    child_name = f"{tag}[{current_indices[tag]}]"
+                else:
+                    child_name = tag
+
+                res = walk(child, trail + [node.tag, child_name])
+                if res is not None:
+                    return res
+            return None
+
+        result = walk(root, [])
+        if result is None:
+            return ""
 
     normalized = []
     skip_next_root = False
@@ -358,6 +386,7 @@ class TableauDoc:
         self.datasource_caption_lookup_by_clean: dict[str, str] = {}
 
         self.root = self._load_root_and_extract_contents()
+        self.parent_map = {c: p for p in self.root.iter() for c in p}
         self.metadata = self._build_metadata()
         self._augment_summary_metrics()
 
@@ -1984,7 +2013,7 @@ class TableauDoc:
 
     def _best_effort_xpath(self, element: ET.Element) -> str:
         try:
-            return element_path_with_indices(self.root, element)
+            return element_path_with_indices(self.root, element, getattr(self, "parent_map", None))
         except Exception:
             return ""
 
